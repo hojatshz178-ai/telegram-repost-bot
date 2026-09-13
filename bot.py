@@ -55,7 +55,7 @@ def save_state(state):
 
 
 def fetch_channel_posts(channel):
-    """صفحه‌ی پیش‌نمایش عمومی کانال رو می‌گیره و پست‌ها رو استخراج می‌کنه."""
+    """صفحه‌ی پیش‌نمایش عمومی کانال رو می‌گیره و پست‌ها (متن + عکس/فیلم) رو استخراج می‌کنه."""
     url = f"https://t.me/s/{channel}"
     try:
         resp = requests.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
@@ -65,19 +65,50 @@ def fetch_channel_posts(channel):
         return []
 
     html_text = resp.text
-    # هر پست داخل یک بلاک با data-post="channel/ID" قرار داره
-    blocks = re.findall(
-        r'data-post="' + re.escape(channel) + r'/(\d+)".*?class="tgme_widget_message_text[^"]*"[^>]*>(.*?)</div>',
-        html_text, re.DOTALL
-    )
+
+    # پیدا کردن نقطه‌ی شروع هر پست
+    starts = [m.start() for m in re.finditer(r'data-post="' + re.escape(channel) + r'/(\d+)"', html_text)]
+    ids = re.findall(r'data-post="' + re.escape(channel) + r'/(\d+)"', html_text)
 
     posts = []
-    for msg_id, raw_text in blocks:
-        text = re.sub(r"<br\s*/?>", "\n", raw_text)
-        text = re.sub(r"<[^>]+>", "", text)
-        text = html.unescape(text).strip()
-        if text:
-            posts.append((int(msg_id), text))
+    for i, msg_id in enumerate(ids):
+        start = starts[i]
+        end = starts[i + 1] if i + 1 < len(starts) else len(html_text)
+        block = html_text[start:end]
+
+        # متن پست
+        text = ""
+        text_match = re.search(
+            r'class="tgme_widget_message_text[^"]*"[^>]*>(.*?)</div>', block, re.DOTALL
+        )
+        if text_match:
+            raw_text = text_match.group(1)
+            text = re.sub(r"<br\s*/?>", "\n", raw_text)
+            text = re.sub(r"<[^>]+>", "", text)
+            text = html.unescape(text).strip()
+
+        # عکس پست (از background-image استخراج می‌شه)
+        photo_url = None
+        photo_match = re.search(
+            r'tgme_widget_message_photo_wrap[^"]*"\s+style="[^"]*background-image:url\(\'([^\']+)\'\)',
+            block,
+        )
+        if photo_match:
+            photo_url = html.unescape(photo_match.group(1))
+
+        # فیلم پست (فقط اگه صفحه‌ی عمومی خود فایل رو در دسترس گذاشته باشه)
+        video_url = None
+        video_match = re.search(r'<video[^>]*class="[^"]*tgme_widget_message_video[^"]*"[^>]*src="([^"]+)"', block)
+        if video_match:
+            video_url = html.unescape(video_match.group(1))
+
+        if text or photo_url or video_url:
+            posts.append({
+                "id": int(msg_id),
+                "text": text,
+                "photo": photo_url,
+                "video": video_url,
+            })
     return posts
 
 
@@ -115,6 +146,34 @@ def send_to_telegram(text):
     resp.raise_for_status()
 
 
+def send_photo_to_telegram(caption, photo_url):
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
+    payload = {
+        "chat_id": TARGET_CHAT_ID,
+        "photo": photo_url,
+        "caption": caption[:1024],  # محدودیت تلگرام برای کپشن رسانه
+        "parse_mode": "HTML",
+    }
+    resp = requests.post(url, json=payload, timeout=30)
+    if not resp.ok:
+        log.error(f"خطا در ارسال عکس به تلگرام: {resp.text}")
+    resp.raise_for_status()
+
+
+def send_video_to_telegram(caption, video_url):
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendVideo"
+    payload = {
+        "chat_id": TARGET_CHAT_ID,
+        "video": video_url,
+        "caption": caption[:1024],
+        "parse_mode": "HTML",
+    }
+    resp = requests.post(url, json=payload, timeout=60)
+    if not resp.ok:
+        log.error(f"خطا در ارسال فیلم به تلگرام: {resp.text}")
+    resp.raise_for_status()
+
+
 def build_final_message(rewritten_text):
     return f"{rewritten_text}\n\n{FOOTER}"
 
@@ -126,20 +185,41 @@ def process_once(state):
             continue
 
         seen_ids = set(state.get(channel, []))
-        new_posts = [p for p in posts if p[0] not in seen_ids]
+        new_posts = [p for p in posts if p["id"] not in seen_ids]
         # اولین بار: فقط جدیدترین پست رو نشونه‌گذاری کن، همه‌ی آرشیو رو پست نکن
         if channel not in state:
-            state[channel] = [p[0] for p in posts]
+            state[channel] = [p["id"] for p in posts]
             save_state(state)
             log.info(f"کانال {channel} برای اولین‌بار ثبت شد، از پست بعدی پردازش می‌شود.")
             continue
 
-        for msg_id, text in sorted(new_posts, key=lambda x: x[0]):
+        for post in sorted(new_posts, key=lambda p: p["id"]):
+            msg_id = post["id"]
+            text = post["text"]
+            photo_url = post["photo"]
+            video_url = post["video"]
+
             log.info(f"پست جدید از {channel} (id={msg_id}) در حال پردازش...")
             try:
-                rewritten = rewrite_with_gemini(text)
-                final_msg = build_final_message(rewritten)
-                send_to_telegram(final_msg)
+                rewritten = rewrite_with_gemini(text) if text else ""
+                final_msg = build_final_message(rewritten) if rewritten else FOOTER
+
+                sent = False
+                if video_url:
+                    try:
+                        send_video_to_telegram(final_msg, video_url)
+                        sent = True
+                    except Exception as e:
+                        log.warning(f"ارسال فیلم پست {msg_id} ناموفق بود، تلاش با متن ساده: {e}")
+                if not sent and photo_url:
+                    try:
+                        send_photo_to_telegram(final_msg, photo_url)
+                        sent = True
+                    except Exception as e:
+                        log.warning(f"ارسال عکس پست {msg_id} ناموفق بود، تلاش با متن ساده: {e}")
+                if not sent:
+                    send_to_telegram(final_msg)
+
                 log.info(f"پست {msg_id} از {channel} با موفقیت ارسال شد.")
             except Exception as e:
                 log.error(f"خطا در پردازش پست {msg_id} از {channel}: {e}")
