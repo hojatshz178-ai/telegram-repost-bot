@@ -18,7 +18,7 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 POLL_INTERVAL_SECONDS = int(os.environ.get("POLL_INTERVAL_SECONDS", "300"))  # هر ۵ دقیقه
 STATE_FILE = "/data/seen_ids.json" if os.path.isdir("/data") else "seen_ids.json"
 
-GEMINI_MODEL = "gemini-2.0-flash"
+GEMINI_MODEL = "gemini-flash-latest"
 GEMINI_API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
 
 FOOTER = "#raptor\n————————\n@khaatshekaan"
@@ -82,14 +82,16 @@ def fetch_channel_posts(channel):
 
 
 def rewrite_with_gemini(text):
-    headers = {"Content-Type": "application/json"}
-    params = {"key": GEMINI_API_KEY}
+    headers = {
+        "Content-Type": "application/json",
+        "X-goog-api-key": GEMINI_API_KEY,
+    }
     payload = {
         "contents": [
             {"parts": [{"text": REWRITE_PROMPT.format(content=text)}]}
         ]
     }
-    resp = requests.post(GEMINI_API_URL, headers=headers, params=params, json=payload, timeout=60)
+    resp = requests.post(GEMINI_API_URL, headers=headers, json=payload, timeout=60)
     resp.raise_for_status()
     data = resp.json()
     candidates = data.get("candidates", [])
