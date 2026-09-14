@@ -244,14 +244,17 @@ def analyze_and_rewrite(text, source_name):
             _key_cursor["i"] += 1
             headers = {"Content-Type": "application/json", "X-goog-api-key": key}
             resp = requests.post(GEMINI_API_URL, headers=headers, json=payload, timeout=60)
-            if resp.status_code != 429:
+            if resp.status_code not in (429, 500, 503):
                 break
-            log.warning("یکی از کلیدهای Gemini به سقف رایگان خورد؛ سوییچ به کلید بعدی...")
+            if resp.status_code == 429:
+                log.warning("یکی از کلیدهای Gemini به سقف رایگان خورد؛ سوییچ به کلید بعدی...")
+            else:
+                log.warning(f"سرور Gemini موقتاً در دسترس نیست (کد {resp.status_code})؛ تلاش با کلید بعدی...")
         else:
             continue
-        if resp.status_code != 429:
+        if resp.status_code not in (429, 500, 503):
             break
-        log.warning(f"همه‌ی کلیدها در این دور به سقف خوردند؛ {wait_seconds} ثانیه صبر می‌کنیم...")
+        log.warning(f"در این دور موفق نشدیم؛ {wait_seconds} ثانیه صبر می‌کنیم...")
         time.sleep(wait_seconds)
         wait_seconds = min(wait_seconds * 2, 120)
 
