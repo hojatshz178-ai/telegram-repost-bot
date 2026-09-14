@@ -12,7 +12,7 @@ import requests
 
 try:
     from zoneinfo import ZoneInfo
-except ImportError:  # پایتون‌های خیلی قدیمی
+except ImportError:
     ZoneInfo = None
 
 try:
@@ -28,7 +28,11 @@ SOURCE_CHANNELS = [c.strip().lstrip("@") for c in os.environ.get("SOURCE_CHANNEL
 SOURCE_WEBSITES = [u.strip() for u in os.environ.get("SOURCE_WEBSITES", "").split(",") if u.strip()]
 TARGET_CHAT_ID = os.environ.get("TARGET_CHAT_ID", "")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+
+# پشتیبانی از چند کلید Gemini (برای چرخش خودکار وقتی به سقف رایگان می‌خوریم)
+_raw_keys = os.environ.get("GEMINI_API_KEYS") or os.environ.get("GEMINI_API_KEY", "")
+GEMINI_API_KEYS = [k.strip() for k in _raw_keys.split(",") if k.strip()]
+
 POLL_INTERVAL_SECONDS = int(os.environ.get("POLL_INTERVAL_SECONDS", "300"))
 DEDUP_WINDOW_MINUTES = int(os.environ.get("DEDUP_WINDOW_MINUTES", "240"))
 DEDUP_SIMILARITY_THRESHOLD = float(os.environ.get("DEDUP_SIMILARITY_THRESHOLD", "0.6"))
@@ -43,34 +47,58 @@ TEHRAN_TZ = ZoneInfo("Asia/Tehran") if ZoneInfo else None
 MORNING_MESSAGE = "🌅 صبح بخیر به همراهان کانال\nروزتون پر از آرامش و اخبار دقیق باشه 🫡\n\n" + FOOTER
 NIGHT_MESSAGE = "🌙 شب بخیر رپتوری‌های عزیز\nفردا با اخبار تازه در خدمتتون هستیم 🛡️\n\n" + FOOTER
 
+# پرامپت اصلی — دقیقاً طبق ۱۵ قانونی که کاربر مشخص کرده
 REWRITE_PROMPT = """تو یک خبرنگار حرفه‌ای حوزه‌ی نظامی، امنیتی و ژئوپلیتیکی هستی که برای یک کانال تلگرامی گزارش می‌نویسی.
 
-متن ورودی زیر یک محتوای خام از منبع «{source_name}» است.
+متن ورودی زیر یک محتوای خام از منبع «{source_name}» است. ممکن است شامل یک یا چند خبر جداگانه باشد.
 
-مرحله ۱ - تشخیص ارتباط:
-مشخص کن آیا این محتوا واقعاً خبر یا تحلیل نظامی/امنیتی/تسلیحاتی/عملیاتی/ژئوپلیتیکی مهم است یا نه.
-اگر پست تبلیغاتی، متفرقه، غیرمرتبط، یا محتوای بی‌ارزش برای یک کانال میلیتاری است، آن را نامرتبط (relevant=false) علامت بزن.
+قوانین کار:
 
-مرحله ۲ - بازنویسی (فقط اگر relevant=true):
-۱. متن را ترجمه‌ی تحت‌اللفظی نکن؛ کاملاً از نو و با ادبیات خودت بازنویسی کن، طوری که اصلاً شبیه ترجمه‌ی ماشینی یا کپی متن منبع نباشد. اطلاعات خبر باید کاملاً حفظ شود.
-۲. سبک نوشتار: خبری، دقیق، حرفه‌ای، تحلیلی اما کوتاه، جذاب برای مخاطب تلگرام، بدون ادبیات زرد یا اغراق‌آمیز، بدون جملات تبلیغاتی یا شعاری.
-۳. تمرکز روی: چه اتفاقی افتاده، کجا، چه طرف‌هایی درگیرند، چه سلاح/سامانه/هواگرد/شناور/تجهیزاتی استفاده شده، اعداد و ارقام مهم، پیامد یا اهمیت راهبردی.
-۴. طول متن (بدون تیتر و بدون امضا): حدود ۱۰۰ تا ۱۸۰ کلمه، مگر خبر اطلاعات مهم زیادی داشته باشد که در این صورت فقط اطلاعات ضروری را نگه دار.
-۵. اگر خبر شامل ادعا، اتهام یا اطلاعات تأییدنشده است، آن را قطعی جلوه نده؛ از عباراتی مثل «بر اساس گزارش‌ها»، «به گفته منابع»، «این گروه مدعی شده»، «در صورت تأیید» استفاده کن.
-۶. نام منبع (رسانه/ارتش/وزارت دفاع/مقام رسمی) را فقط در صورت لزوم برای اعتبار یا فهم خبر بیاور.
-۷. از ۲ تا ۳ ایموجی رسمی و مرتبط با موضوع استفاده کن؛ نه بیشتر، و از پرکردن متن با ایموجی خودداری کن.
-۸. تیتر باید کوتاه، جذاب و خبری/نظامی باشد (نه هیجانی یا اغراق‌آمیز مثل «فاجعه» یا «وحشتناک» مگر خود خبر واقعاً چنین چیزی را ثابت کند).
-۹. ساختار متن: پاراگراف اول = اصل خبر و مهم‌ترین اتفاق. پاراگراف دوم = جزئیات (اعداد، سامانه‌ها، مکان، طرف‌های درگیر). پاراگراف سوم (در صورت نیاز) = اهمیت نظامی یا پیامد احتمالی. از بولت‌پوینت فقط برای فهرست چند عدد/مشخصات مهم استفاده کن.
-۱۰. هیچ اطلاعات مهمی را بدون دلیل حذف نکن، ولی جزئیات کم‌اهمیت و تکراری را حذف کن. چیزی از خودت به‌عنوان واقعیت اضافه نکن.
-۱۱. اگر ورودی حاوی چند خبر جداگانه بود، فقط مهم‌ترین/اولین خبر را پردازش کن (هر خبر پست جداگانه‌ی خودش را دارد).
+۱. اگر متن ورودی شامل چند خبر جداگانه است، همه‌ی آن‌ها را جدا جدا پردازش کن و هیچ‌کدام را با دیگری ادغام نکن؛ هر خبر باید پست کاملاً مستقل خودش را داشته باشد.
 
-خروجی را دقیقاً و فقط به‌شکل یک آبجکت JSON معتبر برگردان (بدون Markdown، بدون بک‌تیک، بدون توضیح اضافه):
+۲. برای هر خبر، اول مشخص کن آیا واقعاً خبر یا تحلیل نظامی/امنیتی/تسلیحاتی/عملیاتی/ژئوپلیتیکی مهم است. اگر محتوا تبلیغاتی، متفرقه، غیرمرتبط یا بی‌ارزش برای یک کانال میلیتاری است، آن را نامرتبط علامت بزن و پردازشش نکن.
+
+۳. متن را هرگز ترجمه‌ی تحت‌اللفظی نکن. محتوای خبر را کاملاً حفظ کن، اما از ابتدا و با ادبیات خودت بازنویسی کن، طوری که اصلاً شبیه متن منبع یا ترجمه‌ی ماشینی نباشد.
+
+۴. سبک نوشتار: گزارش نظامی — خبری، دقیق، حرفه‌ای، تحلیلی اما کوتاه، جذاب برای مخاطب تلگرام، بدون ادبیات زرد یا اغراق‌آمیز، بدون جملات تبلیغاتی یا شعاری.
+
+۵. طول هر پست (بدون تیتر و بدون امضا): معمولاً ۱۰۰ تا ۱۸۰ کلمه کافی است، مگر خبر اطلاعات مهم زیادی داشته باشد که در این صورت فقط اطلاعات ضروری را نگه دار.
+
+۶. برای هر خبر این اطلاعات را در صورت وجود استخراج و منتقل کن: چه اتفاقی افتاده، کجا، چه طرف‌هایی درگیرند، چه سلاح/سامانه/هواگرد/شناور/تجهیزاتی استفاده شده، اعداد و ارقام مهم، نتیجه یا پیامد احتمالی، اهمیت نظامی یا راهبردی خبر.
+
+۷. اگر خبر شامل ادعا، اتهام یا اطلاعات تأییدنشده است، آن را واقعیت قطعی جلوه نده. از عباراتی مثل «بر اساس گزارش‌ها»، «به گفته منابع»، «این گروه مدعی شده»، «گزارش‌های منتشرشده حاکی است»، «در صورت تأیید» استفاده کن.
+
+۸. نام منبع (رسانه/ارتش/وزارت دفاع/مقام رسمی) را فقط زمانی بیاور که برای اعتبار یا فهم خبر ضروری باشد.
+
+۹. از ایموجی کم و کنترل‌شده استفاده کن — در هر پست ۲ تا ۳ ایموجی رسمی و مرتبط با موضوع کافی است؛ متن را با ایموجی پر نکن.
+
+۱۰. تیتر هر پست باید کوتاه، جذاب و نظامی باشد، شبیه این نمونه‌ها:
+«آمریکا سامانه جدیدی را وارد خدمت می‌کند»
+«حمله به زیرساخت نفتی عربستان؛ تصاویر ماهواره‌ای چه می‌گویند؟»
+«ژاپن به دنبال گسترش ناوگان پهپادی خود»
+«ادعای سرنگونی دو پهپاد سعودی توسط حوثی‌ها»
+از تیترهای بیش‌ازحد هیجانی مثل «وحشتناک»، «فاجعه بزرگ»، «ضربه نابودکننده» استفاده نکن مگر خود خبر واقعاً چنین چیزی را ثابت کند.
+
+۱۱. ساختار پیشنهادی هر پست: پاراگراف اول = اصل خبر و مهم‌ترین اتفاق را سریع بیان کن. پاراگراف دوم = جزئیات مهم (اعداد، سامانه‌ها، تسلیحات، مکان، طرف‌های درگیر، نحوه‌ی وقوع). پاراگراف سوم (در صورت نیاز) = اهمیت نظامی یا پیامد احتمالی. از بولت‌پوینت فقط زمانی استفاده کن که چند عدد یا مشخصات مهم وجود داشته باشد.
+
+۱۲. هیچ اطلاعات مهمی را که در متن اصلی آمده بدون دلیل حذف نکن؛ در عین حال جزئیات کم‌اهمیت و تکراری را حذف کن. چیزی از خودت به‌عنوان واقعیت به خبر اضافه نکن. اگر تحلیل اضافه می‌کنی، مشخص باشد که تحلیل است، نه واقعیت خبری.
+
+۱۳. متن باید طبیعی و شبیه نوشته‌ی یک خبرنگار حوزه‌ی دفاعی باشد، نه ترجمه‌ی گوگل. از تکرار عبارت‌های کلیشه‌ای خودداری کن. متن را برای خواندن در تلگرام پاراگراف‌بندی کن.
+
+۱۴. اگر محتوا مربوط به یک منبع خاص (سایت خبری) است و صرفاً یک مقاله‌ی خبری/تحلیلی است (نه چند خبر جدا)، به‌جای پست طولانی، فقط یک چکیده‌ی کوتاه و آماده‌ی انتشار از آن بساز که اطلاعات کلی و مهم را داشته باشد.
+
+خروجی را دقیقاً و فقط به‌شکل یک آبجکت JSON معتبر برگردان (بدون Markdown، بدون بک‌تیک، بدون هیچ توضیح اضافه قبل یا بعد از آن)، با این فرمت:
 {{
-  "relevant": true یا false,
-  "title": "تیتر کوتاه فارسی (اگر relevant=false رشته خالی)",
-  "body": "متن کامل بازنویسی‌شده شامل پاراگراف‌ها، بدون تکرار تیتر در ابتدای متن (اگر relevant=false رشته خالی)",
-  "image_query": "۳ تا ۵ کلمه‌ی انگلیسی کوتاه برای جستجوی یک عکس استوک مرتبط با موضوع خبر (اگر relevant=false رشته خالی)"
+  "items": [
+    {{
+      "relevant": true یا false,
+      "title": "تیتر کوتاه فارسی (اگر relevant=false رشته خالی)",
+      "body": "متن کامل بازنویسی‌شده شامل پاراگراف‌ها، بدون تکرار تیتر در ابتدای متن (اگر relevant=false رشته خالی)",
+      "image_query": "۳ تا ۵ کلمه‌ی انگلیسی کوتاه برای جستجوی یک عکس استوک مرتبط با موضوع این خبر (اگر relevant=false رشته خالی)"
+    }}
+  ]
 }}
+اگر ورودی فقط یک خبر دارد، آرایه‌ی items فقط یک آیتم خواهد داشت.
 
 متن ورودی:
 ---
@@ -188,14 +216,45 @@ def fetch_website_posts(feed_url):
     return posts
 
 
-# ---------- Gemini ----------
+# ---------- Gemini با چرخش خودکار بین چند کلید ----------
+_key_cursor = {"i": 0}
+
+
 def analyze_and_rewrite(text, source_name):
-    headers = {"Content-Type": "application/json", "X-goog-api-key": GEMINI_API_KEY}
+    """
+    متن را به Gemini می‌دهد و لیستی از آیتم‌های خبری (هر کدام یک پست جدا) برمی‌گرداند.
+    اگر یک کلید به سقف رایگان (429) بخورد، خودکار به کلید بعدی سوییچ می‌کند.
+    اگر همه‌ی کلیدها در یک دور به سقف خوردند، با تأخیر فزاینده دوباره تلاش می‌کند.
+    """
+    if not GEMINI_API_KEYS:
+        raise RuntimeError("هیچ GEMINI_API_KEY/GEMINI_API_KEYS تنظیم نشده است.")
+
     payload = {
         "contents": [{"parts": [{"text": REWRITE_PROMPT.format(content=text, source_name=source_name)}]}],
         "generationConfig": {"responseMimeType": "application/json"},
     }
-    resp = requests.post(GEMINI_API_URL, headers=headers, json=payload, timeout=60)
+
+    wait_seconds = 15
+    max_cycles = 3
+    resp = None
+
+    for cycle in range(max_cycles):
+        for _ in range(len(GEMINI_API_KEYS)):
+            key = GEMINI_API_KEYS[_key_cursor["i"] % len(GEMINI_API_KEYS)]
+            _key_cursor["i"] += 1
+            headers = {"Content-Type": "application/json", "X-goog-api-key": key}
+            resp = requests.post(GEMINI_API_URL, headers=headers, json=payload, timeout=60)
+            if resp.status_code != 429:
+                break
+            log.warning("یکی از کلیدهای Gemini به سقف رایگان خورد؛ سوییچ به کلید بعدی...")
+        else:
+            continue
+        if resp.status_code != 429:
+            break
+        log.warning(f"همه‌ی کلیدها در این دور به سقف خوردند؛ {wait_seconds} ثانیه صبر می‌کنیم...")
+        time.sleep(wait_seconds)
+        wait_seconds = min(wait_seconds * 2, 120)
+
     resp.raise_for_status()
     data = resp.json()
     candidates = data.get("candidates", [])
@@ -205,12 +264,17 @@ def analyze_and_rewrite(text, source_name):
     raw = "\n".join(p.get("text", "") for p in parts).strip()
 
     try:
-        return json.loads(raw)
+        parsed = json.loads(raw)
     except json.JSONDecodeError:
         match = re.search(r"\{.*\}", raw, re.DOTALL)
-        if match:
-            return json.loads(match.group(0))
-        raise ValueError(f"خروجی Gemini قابل‌پارس نبود: {raw[:300]}")
+        if not match:
+            raise ValueError(f"خروجی Gemini قابل‌پارس نبود: {raw[:300]}")
+        parsed = json.loads(match.group(0))
+
+    items = parsed.get("items", [])
+    if not items and "relevant" in parsed:
+        items = [parsed]  # سازگاری با پاسخ تک‌آیتمی
+    return items
 
 
 def find_stock_image(query):
@@ -265,7 +329,7 @@ def build_final_message(title, body):
     return "\n\n".join(parts)
 
 
-# ---------- جلوگیری از پست تکراری ----------
+# ---------- جلوگیری از پست تکراری (همان رویداد از چند منبع) ----------
 def is_duplicate(state, title):
     now = time.time()
     recent = state.get("_recent_titles", [])
@@ -302,52 +366,59 @@ def process_posts(state, source_key, posts):
         log.info(f"در حال پردازش {uid}...")
 
         try:
-            if text:
-                result = analyze_and_rewrite(text, post["source_name"])
-            else:
-                result = {"relevant": False}
+            items = analyze_and_rewrite(text, post["source_name"]) if text else []
 
-            if not result.get("relevant"):
-                log.info(f"{uid} نامرتبط تشخیص داده شد و رد شد.")
-            else:
+            if not items:
+                log.info(f"{uid} محتوای متنی قابل‌پردازش نداشت، رد شد.")
+
+            for idx, result in enumerate(items):
+                if not result.get("relevant"):
+                    log.info(f"یک آیتم از {uid} نامرتبط تشخیص داده شد و رد شد.")
+                    continue
+
                 title = (result.get("title") or "").strip()
                 body = (result.get("body") or "").strip()
                 image_query = (result.get("image_query") or "").strip()
 
                 if is_duplicate(state, title):
-                    log.info(f"{uid} به‌عنوان پست تکراری (رویداد مشابه اخیر) رد شد.")
-                else:
-                    final_msg = build_final_message(title, body)
-                    photo_url = post.get("photo")
-                    video_url = post.get("video")
-                    if not photo_url and not video_url and image_query:
-                        photo_url = find_stock_image(image_query)
+                    log.info(f"یک آیتم از {uid} به‌عنوان پست تکراری (رویداد مشابه اخیر) رد شد.")
+                    continue
 
-                    sent = False
-                    if video_url:
-                        try:
-                            send_video_to_telegram(final_msg, video_url)
-                            sent = True
-                        except Exception as e:
-                            log.warning(f"ارسال فیلم {uid} ناموفق بود: {e}")
-                    if not sent and photo_url:
-                        try:
-                            send_photo_to_telegram(final_msg, photo_url)
-                            sent = True
-                        except Exception as e:
-                            log.warning(f"ارسال عکس {uid} ناموفق بود: {e}")
-                    if not sent:
-                        send_to_telegram(final_msg)
+                final_msg = build_final_message(title, body)
 
-                    remember_title(state, title)
-                    log.info(f"{uid} با موفقیت پست شد.")
+                # عکس/فیلم اصلی پست فقط برای اولین خبر همان پیام استفاده می‌شود
+                photo_url = post.get("photo") if idx == 0 else None
+                video_url = post.get("video") if idx == 0 else None
+                if not photo_url and not video_url and image_query:
+                    photo_url = find_stock_image(image_query)
+
+                sent = False
+                if video_url:
+                    try:
+                        send_video_to_telegram(final_msg, video_url)
+                        sent = True
+                    except Exception as e:
+                        log.warning(f"ارسال فیلم برای {uid} ناموفق بود: {e}")
+                if not sent and photo_url:
+                    try:
+                        send_photo_to_telegram(final_msg, photo_url)
+                        sent = True
+                    except Exception as e:
+                        log.warning(f"ارسال عکس برای {uid} ناموفق بود: {e}")
+                if not sent:
+                    send_to_telegram(final_msg)
+
+                remember_title(state, title)
+                log.info(f"یک پست از {uid} با موفقیت منتشر شد.")
+                time.sleep(4)  # فاصله‌ی کوتاه بین چند پست خروجی از یک پیام
+
         except Exception as e:
             log.error(f"خطا در پردازش {uid}: {e}")
 
         state[source_key] = state.get(source_key, []) + [uid]
         state[source_key] = state[source_key][-300:]
         save_state(state)
-        time.sleep(3)
+        time.sleep(6)  # فاصله بین پیام‌های ورودی برای رعایت سقف رایگان Gemini
 
 
 # ---------- پیام‌های زمان‌بندی‌شده ----------
@@ -395,7 +466,7 @@ def main():
     missing = [name for name, val in [
         ("BOT_TOKEN", BOT_TOKEN),
         ("TARGET_CHAT_ID", TARGET_CHAT_ID),
-        ("GEMINI_API_KEY", GEMINI_API_KEY),
+        ("GEMINI_API_KEY یا GEMINI_API_KEYS", "yes" if GEMINI_API_KEYS else ""),
     ] if not val]
     if not SOURCE_CHANNELS and not SOURCE_WEBSITES:
         missing.append("SOURCE_CHANNELS یا SOURCE_WEBSITES (حداقل یکی)")
@@ -404,7 +475,10 @@ def main():
         return
 
     state = load_state()
-    log.info(f"ربات شروع به کار کرد. کانال‌ها: {SOURCE_CHANNELS} | سایت‌ها: {len(SOURCE_WEBSITES)} فید")
+    log.info(
+        f"ربات شروع به کار کرد. کانال‌ها: {SOURCE_CHANNELS} | سایت‌ها: {len(SOURCE_WEBSITES)} فید | "
+        f"تعداد کلید Gemini: {len(GEMINI_API_KEYS)}"
+    )
     while True:
         try:
             process_once(state)
