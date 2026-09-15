@@ -282,10 +282,11 @@ region یکی از این چهار مقدار دقیق باشد:
 
 13) image_query را به انگلیسی و کوتاه، 3 تا 6 کلمه‌ای بده. باید موضوع عکس را دقیق و غیرخیالی بیان کند. اگر تصویر دقیق رویداد در منبع وجود ندارد، عبارت عمومی موضوعی بده؛ ادعا نکن که تصویر دقیق همان رویداد است.
 
-14) source_note یک جمله کوتاه باشد که وضعیت منبع را روشن کند؛ مثال:
-«این خبر بر اساس گزارش اولیه منبع است و هنوز به‌طور مستقل تأیید نشده است.»
+14) نام کانال، نام رسانه، لینک منبع، URL، عبارت «منبع:»، «Source:»، «به نقل از» یا هر نوع ارجاع مستقیم به منبع را داخل title یا body قرار نده؛ خروجی باید به‌صورت مستقل و بدون معرفی منبع منتشر شود.
 
-15) خروجی فقط JSON معتبر باشد، بدون Markdown و بدون توضیح اضافی.
+15) source_note را همیشه رشته خالی برگردان.
+
+16) خروجی فقط JSON معتبر باشد، بدون Markdown و بدون توضیح اضافی.
 
 فرمت:
 {{
@@ -300,7 +301,7 @@ region یکی از این چهار مقدار دقیق باشد:
       "region": "iran|middle_east|world|superpower",
       "event_type": "military_event|security|defense|geopolitics|routine",
       "priority_hint": 0,
-      "source_note": "..."
+      "source_note": ""
     }}
   ]
 }}
@@ -969,11 +970,12 @@ def analyze_and_rewrite(batch_posts, source_name):
         )
 
     content = (
-        f"منبع: {source_name}\n"
         f"این ورودی شامل {len(batch_posts)} پست است. "
         f"اول تشخیص بده کدام‌ها یک رویداد مشترک‌اند و آن‌ها را ادغام کن.\n\n"
         + "\n---\n".join(source_chunks)
     )
+
+    content += "\n\nدستور انتشار: نام کانال/رسانه و هیچ لینک یا URL منبع را در title یا body خروجی نیاور.\n"
 
     prompt = REWRITE_PROMPT.format(
         content=content,
@@ -1729,18 +1731,12 @@ def send_video_to_telegram(title, body, video_url):
 def build_text_only_message(item):
     title = normalize_space(item.get("title", ""))
     body = (item.get("body", "") or "").strip()
-    source_note = (item.get("source_note", "") or "").strip()
-    source_url = item.get("source_url", "")
-
     parts = []
     if title:
         parts.append(title)
     if body:
         parts.append(body)
-    if source_note:
-        parts.append(f"یادداشت منبع: {source_note}")
-    if source_url:
-        parts.append(format_source_link("منبع", source_url))
+    # لینک/نام منبع عمداً در پست نهایی نمایش داده نمی‌شود.
     parts.append(FOOTER)
 
     return "\n\n".join(parts)
@@ -1749,17 +1745,11 @@ def build_text_only_message(item):
 def dispatch_item(item):
     title = normalize_space(item.get("title", ""))
     body = (item.get("body", "") or "").strip()
-    source_note = (item.get("source_note", "") or "").strip()
-    source_url = item.get("source_url", "")
     photo = item.get("photo")
     video = item.get("video")
 
-    media_body_parts = [body]
-    if source_note:
-        media_body_parts.append(f"یادداشت منبع: {source_note}")
-    if source_url:
-        media_body_parts.append(format_source_link("منبع", source_url))
-    media_body = "\n\n".join(x for x in media_body_parts if x)
+    # لینک/نام منبع عمداً در کپشن نهایی نمایش داده نمی‌شود.
+    media_body = body
 
     if video:
         try:
