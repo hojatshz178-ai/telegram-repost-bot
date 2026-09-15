@@ -1,2 +1,4 @@
 requests>=2.31.0,<3
 feedparser>=6.0.10,<7
+beautifulsoup4>=4.12.3,<5
+tzdata>=2025.2

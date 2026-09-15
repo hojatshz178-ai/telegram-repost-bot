@@ -1,38 +1,14 @@
-# -*- coding: utf-8 -*-
-"""
-ربات خبری نظامی — نسخه V2
-ویژگی‌های اصلی:
-- دریافت پست از کانال‌های عمومی تلگرام و فیدهای RSS
-- دریافت og:image مقاله‌های سایت در صورت وجود
-- تحلیل و بازنویسی با Gemini
-- پشتیبانی از GEMINI_API_KEYS با هر تعداد کلید؛ برای این پروژه 14 کلید در نظر گرفته شده
-- چرخش هوشمند کلیدها + cooldown برای 429/5xx
-- جلوگیری از از دست رفتن خبر در خطا؛ خبر فقط پس از موفقیت نهایی علامت‌گذاری می‌شود
-- تجمیع پست‌های پشت‌سرهم مربوط به یک رویداد در یک یا چند جمع‌بندی
-- اولویت‌بندی: رویداد نظامی > خاورمیانه > ایران > قدرت‌های بزرگ > سایر جهان
-- تنوع جغرافیایی در صف تا کانال به یک منطقه محدود نشود
-- فاصله استاندارد انتشار 60 دقیقه
-- در صف شلوغ، فاصله به‌صورت پویا کم می‌شود ولی هرگز کمتر از 30 دقیقه نیست
-- urgent فقط اولویت صف را بالا می‌برد؛ فاصله حداقل 30 دقیقه در همه شرایط حفظ می‌شود
-- مهم: خبرهای مهم زودتر از عادی منتشر می‌شوند ولی کانال را بمباران نمی‌کنند
-- ذخیره پایدار وضعیت در SQLite
-- retry هوشمند برای Telegram و Gemini
-- اعتبارسنجی خروجی JSON و facts
-- عدم استفاده از عکس استوک نامرتبط؛ در نبود تصویر معتبر، پست متنی ارسال می‌شود
-"""
-
 import os
 import re
 import json
 import time
 import html
-import sqlite3
+import hashlib
 import logging
+import tempfile
 import difflib
-from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from urllib.parse import quote, urljoin
-from typing import Optional, List, Dict, Any, Tuple
 
 import requests
 
@@ -42,431 +18,1307 @@ except ImportError:
     feedparser = None
 
 try:
+    from bs4 import BeautifulSoup
+except ImportError:
+    BeautifulSoup = None
+
+try:
     from zoneinfo import ZoneInfo
 except ImportError:
     ZoneInfo = None
 
 
 # ============================================================
-# تنظیمات
+# Logging
 # ============================================================
 
-def env_int(name: str, default: int) -> int:
-    try:
-        return int(os.environ.get(name, str(default)))
-    except (TypeError, ValueError):
-        return default
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+log = logging.getLogger("raptor-news-bot")
 
 
-def env_float(name: str, default: float) -> float:
-    try:
-        return float(os.environ.get(name, str(default)))
-    except (TypeError, ValueError):
+# ============================================================
+# Configuration
+# ============================================================
+
+def env_int(name, default):
+    value = os.environ.get(name)
+    if value is None or value == "":
         return default
+    try:
+        return int(value)
+    except ValueError as exc:
+        raise RuntimeError(f"{name} باید عدد صحیح باشد؛ مقدار فعلی: {value!r}") from exc
+
+
+def env_float(name, default):
+    value = os.environ.get(name)
+    if value is None or value == "":
+        return default
+    try:
+        return float(value)
+    except ValueError as exc:
+        raise RuntimeError(f"{name} باید عدد اعشاری باشد؛ مقدار فعلی: {value!r}") from exc
+
+
+def split_csv(value):
+    return [x.strip() for x in (value or "").split(",") if x.strip()]
 
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 TARGET_CHAT_ID = os.environ.get("TARGET_CHAT_ID", "").strip()
 
 SOURCE_CHANNELS = [
-    c.strip().lstrip("@")
-    for c in os.environ.get("SOURCE_CHANNELS", "").split(",")
-    if c.strip()
+    x.lstrip("@").strip()
+    for x in split_csv(os.environ.get("SOURCE_CHANNELS", ""))
 ]
 
-SOURCE_WEBSITES = [
-    u.strip()
-    for u in os.environ.get("SOURCE_WEBSITES", "").split(",")
-    if u.strip()
-]
+SOURCE_WEBSITES = split_csv(os.environ.get("SOURCE_WEBSITES", ""))
 
-_raw_keys = os.environ.get("GEMINI_API_KEYS") or os.environ.get("GEMINI_API_KEY", "")
-GEMINI_API_KEYS = [k.strip() for k in _raw_keys.split(",") if k.strip()]
+# هر تعداد کلید را قبول می‌کند؛ برای تنظیم فعلی کاربر 14 کلید را در همین متغیر قرار بده.
+_raw_gemini_keys = (
+    os.environ.get("GEMINI_API_KEYS")
+    or os.environ.get("GEMINI_API_KEY", "")
+)
+GEMINI_API_KEYS = split_csv(_raw_gemini_keys)
 
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-flash-latest").strip()
+# مدل قابل تنظیم و pinned؛ alias متغیر latest پیش‌فرض نیست.
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash").strip()
 GEMINI_API_URL = (
-    f"https://generativelanguage.googleapis.com/v1beta/models/"
-    f"{GEMINI_MODEL}:generateContent"
+    "https://generativelanguage.googleapis.com/v1beta/"
+    f"models/{GEMINI_MODEL}:generateContent"
 )
 
-POLL_INTERVAL_SECONDS = max(30, env_int("POLL_INTERVAL_SECONDS", 300))
+POLL_INTERVAL_SECONDS = max(30, env_int("POLL_INTERVAL_SECONDS", 180))
 
-# انتشار:
-STANDARD_SPACING_MINUTES = max(
-    30,
-    env_int(
-        "STANDARD_POST_SPACING_MINUTES",
-        env_int("NORMAL_POST_INTERVAL_MINUTES", 60),
-    ),
-)
-MIN_SPACING_MINUTES = max(
-    30,
-    env_int(
-        "MIN_POST_SPACING_MINUTES",
-        env_int("MIN_POST_INTERVAL_MINUTES", 30),
-    ),
-)
-MAX_SPACING_MINUTES = max(
-    STANDARD_SPACING_MINUTES,
-    env_int("MAX_POST_SPACING_MINUTES", STANDARD_SPACING_MINUTES),
-)
-
-# اگر صف بسیار شلوغ باشد، فاصله به سمت 30 دقیقه می‌رود، ولی از 30 کمتر نمی‌شود.
-QUEUE_TARGET_HOURS = max(1.0, env_float("QUEUE_TARGET_HOURS", 12.0))
-
-# تجمیع رویداد:
-GROUP_WINDOW_MINUTES = max(5, env_int("GROUP_WINDOW_MINUTES", 45))
-MAX_GROUP_POSTS = max(3, env_int("MAX_GROUP_POSTS", 12))
-MAX_SUMMARY_ITEMS_PER_GROUP = max(1, env_int("MAX_SUMMARY_ITEMS_PER_GROUP", 2))
-
-# Duplicate:
-DEDUP_WINDOW_MINUTES = max(30, env_int("DEDUP_WINDOW_MINUTES", 720))
+# تشخیص تکرار بین منابع.
+DEDUP_WINDOW_MINUTES = max(60, env_int("DEDUP_WINDOW_MINUTES", 360))
 DEDUP_SIMILARITY_THRESHOLD = min(
-    0.95, max(0.45, env_float("DEDUP_SIMILARITY_THRESHOLD", 0.72))
+    0.95,
+    max(0.72, env_float("DEDUP_SIMILARITY_THRESHOLD", 0.82)),
 )
 
-# سقف رسانه:
-MAX_PHOTO_BYTES = max(1_000_000, env_int("MAX_PHOTO_BYTES", 10 * 1024 * 1024))
-MAX_VIDEO_BYTES = max(1_000_000, env_int("MAX_VIDEO_BYTES", 50 * 1024 * 1024))
+# صف انتشار: پایه 60، با حجم بالا حداکثر تا 30 دقیقه پایین می‌آید و هرگز کمتر نمی‌شود.
+MAX_QUEUE_SPACING_MINUTES = 60
+MIN_QUEUE_SPACING_MINUTES = 30
 
-# سکوت شبانه تهران
-TEHRAN_TZ = ZoneInfo("Asia/Tehran") if ZoneInfo else None
+# گروه‌بندی خبرهای مربوط به یک رویداد.
+EVENT_CLUSTER_WINDOW_MINUTES = max(
+    30, env_int("EVENT_CLUSTER_WINDOW_MINUTES", 90)
+)
+EVENT_MAX_ITEMS_PER_CLUSTER = max(
+    2, min(10, env_int("EVENT_MAX_ITEMS_PER_CLUSTER", 6))
+)
+EVENT_MAX_OUTPUT_ITEMS = max(
+    1, min(2, env_int("EVENT_MAX_OUTPUT_ITEMS", 2))
+)
+
+# فقط برای ساعت سکوت؛ خبرهای عادی در صف می‌روند.
 MORNING_HOUR = 8
 NIGHT_HOUR = 0
 QUIET_START_HOUR = 0
 QUIET_END_HOUR = 8
 
+# حجم رسانه.
+MAX_IMAGE_BYTES = max(
+    1_000_000, env_int("MAX_IMAGE_BYTES", 10 * 1024 * 1024)
+)
+MAX_VIDEO_BYTES = max(
+    5_000_000, env_int("MAX_VIDEO_BYTES", 45 * 1024 * 1024)
+)
+
+# وضعیت روی volume دائمی قرار بگیرد.
+DEFAULT_STATE_FILE = "/data/state.json" if os.path.isdir("/data") else "state.json"
+STATE_FILE = os.environ.get("STATE_FILE", DEFAULT_STATE_FILE)
+
+# User-Agent ثابت برای RSS / صفحات عمومی.
+HTTP_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (compatible; RaptorNewsBot/2.0; "
+        "+https://t.me/khaatshekaan)"
+    )
+}
+
 FOOTER = "#raptor\n————————\n@khaatshekaan"
+
+TEHRAN_TZ = None
+if ZoneInfo is not None:
+    try:
+        TEHRAN_TZ = ZoneInfo("Asia/Tehran")
+    except Exception:
+        TEHRAN_TZ = timezone.utc
 
 MORNING_MESSAGE = (
     "🌅 صبح بخیر به همراهان کانال\n"
-    "روزتون پر از آرامش و اخبار دقیق باشه 🫡"
+    "روزتون پر از آرامش و اخبار دقیق باشه 🫡\n\n"
+    + FOOTER
 )
+
 NIGHT_MESSAGE = (
     "🌙 شب بخیر رپتوری‌های عزیز\n"
-    "فردا با اخبار تازه در خدمتتون هستیم 🛡️"
+    "فردا با اخبار تازه در خدمتتون هستیم 🛡️\n\n"
+    + FOOTER
 )
 
-DB_FILE = os.environ.get("STATE_DB_FILE", "/data/state.db")
-if not os.path.isdir(os.path.dirname(DB_FILE) or "."):
-    DB_FILE = "state.db"
 
-HTTP_TIMEOUT = (10, 30)
-USER_AGENT = (
-    "Mozilla/5.0 (compatible; MilitaryNewsBot/2.0; "
-    "+https://telegram.org)"
-)
+# ============================================================
+# Constants: geography / priority
+# ============================================================
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s"
-)
-log = logging.getLogger("military-news-bot")
+IRAN_TERMS = {
+    "iran", "ایران", "تهران", "tehran", "isfahan", "اصفهان", "تبریز",
+    "tbriz", "shiraz", "شیراز", "سپاه", "ارتش", "نیروی قدس", "iranian",
+    "iranian forces", "persian gulf", "خلیج فارس",
+}
+
+MIDDLE_EAST_TERMS = {
+    "iran", "ایران", "iraq", "عراق", "syria", "سوریه", "lebanon", "لبنان",
+    "israel", "اسرائیل", "palestine", "فلسطین", "gaza", "غزه", "yemen",
+    "یمن", "saudi", "saudi arabia", "عربستان", "uae", "امارات", "qatar",
+    "قطر", "bahrain", "بحرین", "jordan", "اردن", "egypt", "مصر", "turkey",
+    "ترکیه", "iraqi", "syrian", "israeli", "levant", "middle east",
+    "خاورمیانه", "غزه", "کرانه باختری", "دریای سرخ", "red sea",
+    "عراق", "عمانی", "oman", "عمان",
+}
+
+SUPERPOWER_TERMS = {
+    "united states", "usa", "u.s.", "america", "آمریکا", "ایالات متحده",
+    "russia", "روسیه", "moscow", "مسکو", "china", "چین", "beijing", "پکن",
+    "united states", "france", "فرانسه", "uk", "بریتانیا", "britain",
+    "germany", "آلمان", "japan", "ژاپن", "india", "هند",
+}
+
+MILITARY_EVENT_TERMS = {
+    "war", "جنگ", "attack", "حمله", "strike", "حملات", "airstrike",
+    "bombing", "بمباران", "invasion", "تهاجم", "clash", "درگیری",
+    "conflict", "تنش نظامی", "missile", "موشک", "drone", "پهپاد",
+    "fighter", "جنگنده", "air defense", "پدافند", "shootdown", "سرنگونی",
+    "intercept", "رهگیری", "navy", "نیروی دریایی", "military", "نظامی",
+    "army", "ارتش", "operation", "عملیات", "offensive", "تهاجمی",
+    "ceasefire", "آتش‌بس", "escalation", "تشدید درگیری", "mobilization",
+    "بسیج", "deployment", "استقرار", "base", "پایگاه", "explosion",
+    "انفجار", "casualties", "تلفات", "front", "جبهه", "battle", "نبرد",
+}
+
+BREAKING_TERMS = {
+    "breaking", "urgent", "فوری", "خبر فوری", "عاجل", "العاجل",
+    "لحظه‌ای", "همین حالا", "در حال وقوع", "breaking news",
+}
+
+WORLD_VARIETY_TERMS = {
+    "europe", "اروپا", "africa", "آفریقا", "asia", "آسیا", "pacific",
+    "اقیانوس آرام", "latin america", "آمریکای لاتین", "ukraine", "اوکراین",
+    "taiwan", "تایوان", "korea", "کره", "north korea", "کره شمالی",
+}
+
+STOPWORDS = {
+    "the", "a", "an", "and", "or", "to", "of", "in", "on", "for", "with",
+    "from", "at", "by", "is", "are", "was", "were", "be", "as", "that",
+    "this", "it", "its", "after", "before", "into", "over", "under",
+    "خبر", "گزارش", "گفت", "گفته", "اعلام", "اعلام کرد", "بر اساس",
+    "در", "از", "به", "برای", "با", "که", "این", "آن", "یک", "و", "یا",
+    "اما", "هم", "نیز", "است", "هست", "شد", "شده", "می", "شود", "کرد",
+    "کرده", "خواهد", "روی", "درون", "درباره", "بر", "تا", "را", "از سوی",
+}
 
 
 # ============================================================
-# SQLite
+# Prompt
 # ============================================================
 
-def db_connect() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_FILE, timeout=30)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA busy_timeout=30000")
-    return conn
+REWRITE_PROMPT = """تو یک دبیر ارشد و دقیق برای یک کانال خبری/تحلیلی فارسی در حوزه نظامی، امنیتی و ژئوپلیتیکی هستی.
 
+ورودی می‌تواند شامل چند پست پشت سرهم از یک منبع باشد. هدف اصلی این است که یک کانال مرجع، تمیز و غیرهیجانی ساخته شود؛ نه کانالی که یک واقعه را با ده‌ها پست کوتاه پشت سر هم منتشر کند.
 
-def init_db() -> None:
-    with db_connect() as conn:
-        conn.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS source_items (
-                uid TEXT PRIMARY KEY,
-                source_key TEXT NOT NULL,
-                source_name TEXT NOT NULL,
-                published_at TEXT,
-                discovered_at TEXT NOT NULL,
-                text TEXT NOT NULL DEFAULT '',
-                photo_url TEXT,
-                video_url TEXT,
-                source_url TEXT,
-                status TEXT NOT NULL DEFAULT 'new',
-                attempts INTEGER NOT NULL DEFAULT 0,
-                last_error TEXT
-            );
+قواعد بسیار مهم:
 
-            CREATE INDEX IF NOT EXISTS idx_source_items_status
-            ON source_items(status);
+1) اگر چند ورودی مربوط به یک رویداد واحد هستند، آن‌ها را در یک جمع‌بندی واحد ادغام کن. در صورت وجود دو تحول واقعاً متفاوت اما مرتبط، حداکثر دو خروجی بده. بیشتر از دو خروجی برای یک batch مجاز نیست.
 
-            CREATE TABLE IF NOT EXISTS queue (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                title TEXT NOT NULL,
-                body TEXT NOT NULL,
-                photo_url TEXT,
-                video_url TEXT,
-                label TEXT NOT NULL,
-                priority INTEGER NOT NULL DEFAULT 50,
-                urgent INTEGER NOT NULL DEFAULT 0,
-                important INTEGER NOT NULL DEFAULT 0,
-                region TEXT NOT NULL DEFAULT 'other',
-                event_key TEXT,
-                source_time TEXT,
-                queued_at REAL NOT NULL,
-                available_at REAL NOT NULL DEFAULT 0
-            );
+2) پست‌های تکمیلی مثل «تصاویر تازه»، «جزئیات بیشتر»، «بیانیه طرف مقابل» یا «آمار جدید» را فقط وقتی جدا کن که واقعاً یک تحول جدید و مستقل باشند؛ وگرنه با خبر اصلی ادغامشان کن.
 
-            CREATE INDEX IF NOT EXISTS idx_queue_priority
-            ON queue(priority DESC, urgent DESC, important DESC, queued_at ASC);
+3) هیچ ادعای تأییدنشده‌ای را قطعی ننویس. از عباراتی مانند «بر اساس گزارش‌ها»، «به گفته منابع»، «این رسانه مدعی شده»، «در صورت تأیید» استفاده کن.
 
-            CREATE TABLE IF NOT EXISTS posted_events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                title TEXT NOT NULL,
-                event_key TEXT,
-                posted_at REAL NOT NULL
-            );
+4) محتوای منبع را تحریف نکن و چیزی را که در منبع وجود ندارد به عنوان واقعیت نساز. اگر نکته‌ای تحلیل خودت است، با زبان تحلیلی و روشن از خبر جدا کن.
 
-            CREATE INDEX IF NOT EXISTS idx_posted_events_time
-            ON posted_events(posted_at);
+5) هر خروجی یک پست خبری مستقل برای تلگرام است. تیتر کوتاه، دقیق و بدون اغراق باشد.
 
-            CREATE TABLE IF NOT EXISTS kv (
-                key TEXT PRIMARY KEY,
-                value TEXT
-            );
-            """
-        )
+6) متن هر پست معمولاً حدود 90 تا 170 کلمه باشد؛ اگر یک جمع‌بندی رویداد چند منبع/پست دارد، می‌توانی تا حدود 220 کلمه بروی، ولی از تکرار دوری کن.
 
+7) ساختار:
+- پاراگراف اول: اصل اتفاق
+- پاراگراف دوم: مهم‌ترین جزئیات
+- پاراگراف سوم: فقط در صورت نیاز، اهمیت یا پیامد احتمالی
+- از جملات تبلیغاتی، شعاری و زرد پرهیز کن.
 
-def kv_get(key: str, default: str = "") -> str:
-    with db_connect() as conn:
-        row = conn.execute("SELECT value FROM kv WHERE key=?", (key,)).fetchone()
-        return row["value"] if row else default
+8) فوریت:
+urgent=true فقط برای اتفاقی که واقعاً لحظه‌ای و فوری است؛ مانند شروع ناگهانی درگیری یا حمله در حال وقوع.
+urgent برای خبر عادی، گزارش تحلیلی یا خبری که چند ساعت از آن گذشته false است.
 
+9) اهمیت:
+important=true برای خبر مهمی که باید در صف زودتر بیاید؛ حتی اگر urgent=false باشد.
 
-def kv_set(key: str, value: str) -> None:
-    with db_connect() as conn:
-        conn.execute(
-            """
-            INSERT INTO kv(key,value) VALUES(?,?)
-            ON CONFLICT(key) DO UPDATE SET value=excluded.value
-            """,
-            (key, value),
-        )
+10) منطقه:
+region یکی از این چهار مقدار دقیق باشد:
+- "iran"
+- "middle_east"
+- "world"
+- "superpower"
+
+اگر خبر مستقیم درباره ایران است، region=iran.
+اگر درباره دیگر نقاط خاورمیانه است، region=middle_east.
+اگر تمرکز اصلی روی آمریکا/روسیه/چین و مانند آن است و رویداد خارج از خاورمیانه است، region=superpower.
+در غیر این صورت region=world.
+
+11) event_type یکی از این موارد باشد:
+- "military_event"
+- "security"
+- "defense"
+- "geopolitics"
+- "routine"
+
+12) priority_hint عددی بین 0 تا 100 بده. این فقط یک راهنمای مدل است و سیستم صف‌بندی خودش دوباره اولویت را محاسبه می‌کند.
+
+13) image_query را به انگلیسی و کوتاه، 3 تا 6 کلمه‌ای بده. باید موضوع عکس را دقیق و غیرخیالی بیان کند. اگر تصویر دقیق رویداد در منبع وجود ندارد، عبارت عمومی موضوعی بده؛ ادعا نکن که تصویر دقیق همان رویداد است.
+
+14) source_note یک جمله کوتاه باشد که وضعیت منبع را روشن کند؛ مثال:
+«این خبر بر اساس گزارش اولیه منبع است و هنوز به‌طور مستقل تأیید نشده است.»
+
+15) خروجی فقط JSON معتبر باشد، بدون Markdown و بدون توضیح اضافی.
+
+فرمت:
+{
+  "items": [
+    {
+      "relevant": true,
+      "urgent": false,
+      "important": false,
+      "title": "...",
+      "body": "...",
+      "image_query": "...",
+      "region": "iran|middle_east|world|superpower",
+      "event_type": "military_event|security|defense|geopolitics|routine",
+      "priority_hint": 0,
+      "source_note": "..."
+    }
+  ]
+}
+
+متن/پست‌های ورودی:
+---
+{content}
+---
+"""
 
 
 # ============================================================
-# ابزارهای عمومی
+# General helpers
 # ============================================================
 
-def now_utc() -> datetime:
-    return datetime.now(timezone.utc)
-
-
-def now_ts() -> float:
+def now_ts():
     return time.time()
 
 
-def tehran_now() -> datetime:
-    if TEHRAN_TZ:
-        return datetime.now(TEHRAN_TZ)
-    return datetime.now()
+def now_tehran():
+    return datetime.now(TEHRAN_TZ or timezone.utc)
 
 
-def is_quiet_hour(dt: Optional[datetime] = None) -> bool:
-    dt = dt or tehran_now()
-    return QUIET_START_HOUR <= dt.hour < QUIET_END_HOUR
-
-
-def clean_html_text(value: str) -> str:
-    if not value:
+def normalize_space(text):
+    if not text:
         return ""
-    value = re.sub(r"<br\s*/?>", "\n", value, flags=re.I)
-    value = re.sub(r"<[^>]+>", " ", value)
-    value = html.unescape(value)
-    value = re.sub(r"[ \t]+", " ", value)
-    value = re.sub(r"\n\s*\n\s*\n+", "\n\n", value)
-    return value.strip()
+    text = text.replace("\u200c", " ")
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
 
 
-def safe_iso(value: Any) -> Optional[str]:
-    if value is None:
+def clean_text(text):
+    if not text:
+        return ""
+    return normalize_space(
+        BeautifulSoup(text, "html.parser").get_text(" ", strip=True)
+        if BeautifulSoup is not None and "<" in text
+        else html.unescape(text)
+    )
+
+
+def canonical_url(url):
+    if not url:
+        return ""
+    return url.strip()
+
+
+def sha1_text(value):
+    return hashlib.sha1(value.encode("utf-8", errors="ignore")).hexdigest()
+
+
+def parse_datetime_from_struct(value):
+    if not value:
         return None
-    text = str(value).strip()
-    return text or None
+    try:
+        dt = datetime(*value[:6], tzinfo=timezone.utc)
+        return dt
+    except Exception:
+        return None
 
 
-def parse_feed_time(entry: Any) -> Optional[str]:
-    # RSS parser معمولا parsed time را در published_parsed یا updated_parsed می‌دهد.
-    for key in ("published_parsed", "updated_parsed", "created_parsed"):
-        tm = entry.get(key)
-        if tm:
+def parse_iso_or_now(value):
+    if not value:
+        return datetime.now(timezone.utc)
+    try:
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except Exception:
+        return datetime.now(timezone.utc)
+
+
+def format_source_link(label, url):
+    if not url:
+        return label
+    return f"منبع: {url}"
+
+
+def split_sentences(text):
+    text = normalize_space(text)
+    if not text:
+        return []
+    return [
+        x.strip()
+        for x in re.split(r"(?<=[.!?؟。])\s+", text)
+        if x.strip()
+    ]
+
+
+def truncate_text(text, max_chars):
+    text = text or ""
+    if len(text) <= max_chars:
+        return text
+    part = text[:max_chars]
+    # نزدیک‌ترین مرز مناسب را پیدا کن.
+    candidates = [
+        part.rfind("\n\n"),
+        part.rfind("\n"),
+        part.rfind(". "),
+        part.rfind("! "),
+        part.rfind("؟ "),
+    ]
+    cut = max(candidates)
+    if cut < max_chars * 0.55:
+        cut = max_chars
+    return part[:cut].rstrip() + "…"
+
+
+def safe_bool(value):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"true", "1", "yes", "بله"}
+    return bool(value)
+
+
+def safe_int(value, default=0):
+    try:
+        return int(value)
+    except Exception:
+        return default
+
+
+# ============================================================
+# State
+# ============================================================
+
+def default_state():
+    return {
+        "version": 2,
+        "_source_initialized": {},
+        "_recent_titles": [],
+        "_recent_events": [],
+        "_pending_queue": [],
+        "_last_queue_release_ts": 0,
+        "_last_morning_date": "",
+        "_last_night_date": "",
+        "_last_queue_purge_date": "",
+        "_last_posted_region": "",
+        "_last_posted_regions": [],
+        "_gemini_keys": {},
+    }
+
+
+def load_state():
+    if not os.path.exists(STATE_FILE):
+        return default_state()
+
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            state = json.load(f)
+        if not isinstance(state, dict):
+            return default_state()
+
+        base = default_state()
+        base.update(state)
+
+        # مهاجرت امن از حالت قبلی.
+        if not isinstance(base.get("_pending_queue"), list):
+            base["_pending_queue"] = []
+        if not isinstance(base.get("_recent_titles"), list):
+            base["_recent_titles"] = []
+        if not isinstance(base.get("_recent_events"), list):
+            base["_recent_events"] = []
+        if not isinstance(base.get("_last_posted_regions"), list):
+            base["_last_posted_regions"] = []
+
+        return base
+    except Exception as exc:
+        log.exception("خواندن state شکست خورد؛ state خالی ساخته می‌شود: %s", exc)
+        return default_state()
+
+
+def save_state(state):
+    """
+    Atomic write:
+    temp -> flush -> fsync -> replace
+    در صورت قطع ناگهانی، state قبلی سالم می‌ماند.
+    """
+    path = os.path.abspath(STATE_FILE)
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, exist_ok=True)
+
+    fd, temp_path = tempfile.mkstemp(
+        prefix=".state.",
+        suffix=".tmp",
+        dir=directory,
+    )
+
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temp_path, path)
+    finally:
+        if os.path.exists(temp_path):
             try:
-                return datetime(*tm[:6], tzinfo=timezone.utc).isoformat()
-            except Exception:
+                os.unlink(temp_path)
+            except OSError:
                 pass
 
-    for key in ("published", "updated", "created"):
-        value = entry.get(key)
-        if value:
-            return str(value)
 
-    return None
+# ============================================================
+# Tokenization / similarity / event detection
+# ============================================================
+
+def normalize_for_match(text):
+    text = (text or "").lower()
+    replacements = {
+        "ي": "ی",
+        "ى": "ی",
+        "ك": "ک",
+        "ۀ": "ه",
+        "ة": "ه",
+        "ؤ": "و",
+        "إ": "ا",
+        "أ": "ا",
+        "ٱ": "ا",
+    }
+    for old, new in replacements.items():
+        text = text.replace(old, new)
+
+    text = re.sub(r"[^\w\s\u0600-\u06ff.-]", " ", text)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
 
 
-def normalize_title(title: str) -> str:
-    title = title.lower()
-    title = re.sub(r"[\W_]+", " ", title, flags=re.UNICODE)
-    return re.sub(r"\s+", " ", title).strip()
+def tokens(text):
+    text = normalize_for_match(text)
+    raw = re.findall(r"[\w\u0600-\u06ff]{2,}", text, flags=re.UNICODE)
+    return {
+        token for token in raw
+        if token not in STOPWORDS and not token.isdigit()
+    }
 
 
-def title_similarity(a: str, b: str) -> float:
+def token_similarity(a, b):
+    ta = tokens(a)
+    tb = tokens(b)
+    if not ta or not tb:
+        return 0.0
+    return len(ta & tb) / max(1, len(ta | tb))
+
+
+def title_similarity(a, b):
     return difflib.SequenceMatcher(
-        None, normalize_title(a), normalize_title(b)
+        None,
+        normalize_for_match(a),
+        normalize_for_match(b),
     ).ratio()
 
 
-def html_safe_message(title: str, body: str) -> str:
-    # Gemini اجازه HTML نمی‌گیرد؛ بنابراین کل متن را escape می‌کنیم.
-    parts = []
-    if title:
-        parts.append(f"<b>{html.escape(title)}</b>")
-    if body:
-        parts.append(html.escape(body))
-    parts.append(html.escape(FOOTER))
-    return "\n\n".join(parts)
+def combined_similarity(a_title, a_body, b_title, b_body):
+    t = title_similarity(a_title, b_title)
+    j = token_similarity(
+        f"{a_title} {a_body}",
+        f"{b_title} {b_body}",
+    )
+    return max(t * 0.75 + j * 0.25, j)
 
 
-def trim_text(text: str, max_chars: int) -> str:
-    if len(text) <= max_chars:
-        return text
-    return text[:max_chars].rsplit(" ", 1)[0] + "…"
-
-
-# ============================================================
-# Telegram source scraping
-# ============================================================
-
-def fetch_channel_posts(channel: str) -> List[Dict[str, Any]]:
+def related_post(a, b):
     """
-    کانال عمومی را از t.me/s می‌خواند.
-    این روش برای کانال عمومی است؛ کانال خصوصی با آن قابل دریافت نیست.
+    تشخیص ارزان و محافظه‌کارانه برای گروه‌کردن پست‌های یک واقعه.
+    قرار نیست صددرصد معنایی باشد؛ هدف این است که پست‌های واضحاً مرتبط را
+    قبل از Gemini به یک batch بدهیم و مصرف API کم شود.
     """
-    url = f"https://t.me/s/{channel}"
-    try:
-        resp = requests.get(
-            url, timeout=HTTP_TIMEOUT, headers={"User-Agent": USER_AGENT}
-        )
-        resp.raise_for_status()
-    except requests.RequestException as exc:
-        log.warning("خطا در دریافت کانال %s: %s", channel, exc)
-        return []
+    dt_a = parse_iso_or_now(a.get("published_at"))
+    dt_b = parse_iso_or_now(b.get("published_at"))
 
-    page = resp.text
-    matches = list(
-        re.finditer(
-            r'data-post="' + re.escape(channel) + r'/(\d+)"',
-            page
-        )
+    delta_minutes = abs((dt_a - dt_b).total_seconds()) / 60.0
+    if delta_minutes > EVENT_CLUSTER_WINDOW_MINUTES:
+        return False
+
+    a_title = a.get("title") or a.get("text", "")[:220]
+    b_title = b.get("title") or b.get("text", "")[:220]
+    a_body = a.get("text", "")
+    b_body = b.get("text", "")
+
+    sim = combined_similarity(a_title, a_body, b_title, b_body)
+    if sim >= 0.34:
+        return True
+
+    at = tokens(f"{a_title} {a_body}")
+    bt = tokens(f"{b_title} {b_body}")
+
+    strong_a = {
+        x for x in at
+        if x in {normalize_for_match(v) for v in MILITARY_EVENT_TERMS}
+    }
+    strong_b = {
+        x for x in bt
+        if x in {normalize_for_match(v) for v in MILITARY_EVENT_TERMS}
+    }
+
+    if len(at & bt) >= 3:
+        return True
+
+    if strong_a and strong_b and len(at & bt) >= 2:
+        return True
+
+    # پست‌های تکمیلی رایج:
+    combined_title = normalize_for_match(f"{a_title} {b_title}")
+    continuation_terms = (
+        "جزئیات", "تصاویر", "ادامه", "به روزرسانی", "بروزرسانی",
+        "update", "details", "new footage", "latest",
+    )
+    if any(x in combined_title for x in continuation_terms) and len(at & bt) >= 1:
+        return True
+
+    return False
+
+
+def cluster_posts(posts):
+    """
+    پست‌های جدید را به گروه‌های رویدادی تقسیم می‌کند.
+    هر گروه حداکثر EVENT_MAX_ITEMS_PER_CLUSTER ورودی دارد.
+    """
+    ordered = sorted(
+        posts,
+        key=lambda p: parse_iso_or_now(p.get("published_at")),
     )
 
-    posts = []
-    for idx, match in enumerate(matches):
-        msg_id = match.group(1)
-        start = match.start()
-        end = matches[idx + 1].start() if idx + 1 < len(matches) else len(page)
-        block = page[start:end]
+    clusters = []
+    for post in ordered:
+        placed = False
 
-        text = ""
-        m = re.search(
-            r'class="tgme_widget_message_text[^"]*"[^>]*>(.*?)</div>',
-            block,
-            flags=re.DOTALL | re.I,
+        # ابتدا نزدیک‌ترین خوشه زمانی را بررسی کن.
+        candidate_indices = list(range(max(0, len(clusters) - 12), len(clusters)))
+        for idx in reversed(candidate_indices):
+            cluster = clusters[idx]
+            if len(cluster) >= EVENT_MAX_ITEMS_PER_CLUSTER:
+                continue
+
+            if any(related_post(post, existing) for existing in cluster):
+                cluster.append(post)
+                placed = True
+                break
+
+        if not placed:
+            clusters.append([post])
+
+    return clusters
+
+
+# ============================================================
+# Geography / priority
+# ============================================================
+
+def contains_any(text, terms):
+    normalized = normalize_for_match(text)
+    return any(normalize_for_match(term) in normalized for term in terms)
+
+
+def infer_region(text, model_region=None):
+    model_region = (model_region or "").strip().lower()
+    if model_region in {"iran", "middle_east", "world", "superpower"}:
+        # ایران باید اولویت خودش را نگه دارد.
+        if contains_any(text, IRAN_TERMS):
+            return "iran"
+        return model_region
+
+    if contains_any(text, IRAN_TERMS):
+        return "iran"
+    if contains_any(text, MIDDLE_EAST_TERMS):
+        return "middle_east"
+    if contains_any(text, SUPERPOWER_TERMS):
+        return "superpower"
+    return "world"
+
+
+def is_military_event(text, event_type=""):
+    if event_type == "military_event":
+        return True
+    return contains_any(text, MILITARY_EVENT_TERMS)
+
+
+def is_breaking(text):
+    return contains_any(text, BREAKING_TERMS)
+
+
+def calculate_priority(item):
+    """
+    قواعد موردنظر کاربر:
+    1. واقعه نظامی / حمله / جنگ بالاتر از خبر عادی
+    2. خاورمیانه بالاتر از سایر جهان
+    3. ایران بالاتر از غیرایرانی
+    4. ابرقدرت‌ها مهم
+    5. تنوع جهانی حفظ شود، بنابراین region تکراری کمی جریمه می‌گیرد.
+    """
+    title = item.get("title", "")
+    body = item.get("body", "")
+    text = f"{title}\n{body}"
+
+    region = infer_region(text, item.get("region"))
+    event_type = item.get("event_type", "routine")
+
+    score = 0
+
+    if is_military_event(text, event_type):
+        score += 55
+
+    if safe_bool(item.get("urgent")):
+        score += 40
+
+    if safe_bool(item.get("important")):
+        score += 20
+
+    if region == "iran":
+        score += 35
+    elif region == "middle_east":
+        score += 25
+    elif region == "superpower":
+        score += 18
+    else:
+        score += 5
+
+    if contains_any(text, SUPERPOWER_TERMS):
+        score += 8
+
+    # رویدادها و حملات لحظه‌ای کمی جلوتر.
+    if is_breaking(text):
+        score += 18
+
+    # راهنمای Gemini فقط نقش tie-breaker دارد.
+    model_hint = min(100, max(0, safe_int(item.get("priority_hint"), 0)))
+    score += int(model_hint * 0.12)
+
+    # تازگی خبر هم در اولویت اثر می‌گذارد؛ خبر بسیار قدیمی نباید صرفاً به دلیل
+    # برچسب important یک‌باره بالاتر از خبر تازه قرار بگیرد.
+    published_at = item.get("published_at") or ""
+    try:
+        published_dt = parse_iso_or_now(published_at)
+        age_minutes = max(0.0, (datetime.now(timezone.utc) - published_dt.astimezone(timezone.utc)).total_seconds() / 60.0)
+        if age_minutes <= 60:
+            score += 8
+        elif age_minutes <= 180:
+            score += 4
+        elif age_minutes > 24 * 60 and not safe_bool(item.get("urgent")):
+            score -= 8
+    except Exception:
+        pass
+
+    # خبر جهانی صفر نمی‌شود؛ فقط نسبت به اولویت منطقه‌ای کمی عقب‌تر است.
+    if region == "world" and not is_military_event(text, event_type):
+        score -= 3
+
+    return score, region
+
+
+def apply_queue_diversity_score(state, item):
+    score, region = calculate_priority(item)
+    recent_regions = state.get("_last_posted_regions", [])[-3:]
+
+    if recent_regions and region == recent_regions[-1]:
+        score -= 10
+    if len(recent_regions) >= 2 and all(x == region for x in recent_regions[-2:]):
+        score -= 20
+
+    # اگر خبر نظامی/ایرانی مهم باشد، تنوع نباید آن را کاملاً عقب بیندازد.
+    if safe_bool(item.get("urgent")):
+        score += 20
+
+    item["region"] = region
+    item["priority_score"] = score
+    return score
+
+
+# ============================================================
+# Gemini key rotation with persistent cooldown
+# ============================================================
+
+def key_id(key):
+    return sha1_text(key)[:16]
+
+
+def initialize_gemini_key_state(state):
+    state_keys = state.setdefault("_gemini_keys", {})
+    for key in GEMINI_API_KEYS:
+        kid = key_id(key)
+        state_keys.setdefault(
+            kid,
+            {
+                "cooldown_until": 0,
+                "fail_count": 0,
+                "last_status": 0,
+                "last_used": 0,
+            },
         )
-        if m:
-            text = clean_html_text(m.group(1))
+    return state_keys
+
+
+def cleanup_gemini_key_state(state):
+    state_keys = initialize_gemini_key_state(state)
+    valid_ids = {key_id(k) for k in GEMINI_API_KEYS}
+    for kid in list(state_keys):
+        if kid not in valid_ids:
+            del state_keys[kid]
+
+
+def choose_available_key(state, start_index):
+    key_states = initialize_gemini_key_state(state)
+    now = now_ts()
+
+    ordered = []
+    total = len(GEMINI_API_KEYS)
+
+    for offset in range(total):
+        idx = (start_index + offset) % total
+        key = GEMINI_API_KEYS[idx]
+        info = key_states[key_id(key)]
+        if info.get("cooldown_until", 0) <= now:
+            ordered.append((idx, key))
+
+    if ordered:
+        return ordered
+
+    # اگر همه cooldown هستند، نزدیک‌ترین cooldown را انتخاب کن.
+    fallback = []
+    for idx, key in enumerate(GEMINI_API_KEYS):
+        info = key_states[key_id(key)]
+        fallback.append((info.get("cooldown_until", 0), idx, key))
+    fallback.sort(key=lambda x: x[0])
+    return [(fallback[0][1], fallback[0][2])]
+
+
+def set_key_failure(state, key, status, cooldown_seconds):
+    info = state["_gemini_keys"][key_id(key)]
+    info["cooldown_until"] = now_ts() + cooldown_seconds
+    info["fail_count"] = int(info.get("fail_count", 0)) + 1
+    info["last_status"] = status
+    info["last_used"] = now_ts()
+
+
+def set_key_success(state, key):
+    info = state["_gemini_keys"][key_id(key)]
+    info["cooldown_until"] = 0
+    info["fail_count"] = 0
+    info["last_status"] = 200
+    info["last_used"] = now_ts()
+
+
+def retry_after_from_response(resp, default_seconds=30):
+    value = resp.headers.get("Retry-After")
+    if value:
+        try:
+            return max(1, int(float(value)))
+        except ValueError:
+            pass
+    return default_seconds
+
+
+# ============================================================
+# Gemini analysis
+# ============================================================
+
+def parse_json_response(raw):
+    raw = (raw or "").strip()
+
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        pass
+
+    # حذف ```json ... ```
+    cleaned = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s*```$", "", cleaned).strip()
+
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        pass
+
+    match = re.search(r"\{.*\}", raw, flags=re.DOTALL)
+    if match:
+        return json.loads(match.group(0))
+
+    raise ValueError(f"خروجی Gemini JSON نیست: {raw[:500]}")
+
+
+def validate_gemini_items(items):
+    if not isinstance(items, list):
+        raise ValueError("Gemini items باید list باشد.")
+
+    validated = []
+
+    for raw in items[:EVENT_MAX_OUTPUT_ITEMS]:
+        if not isinstance(raw, dict):
+            continue
+
+        relevant = safe_bool(raw.get("relevant"))
+        if not relevant:
+            validated.append(
+                {
+                    "relevant": False,
+                    "urgent": False,
+                    "important": False,
+                    "title": "",
+                    "body": "",
+                    "image_query": "",
+                    "region": "world",
+                    "event_type": "routine",
+                    "priority_hint": 0,
+                    "source_note": "",
+                }
+            )
+            continue
+
+        title = normalize_space(str(raw.get("title", "")))
+        body = str(raw.get("body", "")).strip()
+        image_query = normalize_space(str(raw.get("image_query", "")))
+
+        if not title or not body:
+            continue
+
+        event_type = str(raw.get("event_type", "routine")).strip()
+        allowed_event_types = {
+            "military_event", "security", "defense", "geopolitics", "routine"
+        }
+        if event_type not in allowed_event_types:
+            event_type = "routine"
+
+        validated.append(
+            {
+                "relevant": True,
+                "urgent": safe_bool(raw.get("urgent")),
+                "important": safe_bool(raw.get("important")),
+                "title": title[:220],
+                "body": body[:5000],
+                "image_query": image_query[:180],
+                "region": str(raw.get("region", "world")).strip().lower(),
+                "event_type": event_type,
+                "priority_hint": min(100, max(0, safe_int(raw.get("priority_hint"), 0))),
+                "source_note": normalize_space(str(raw.get("source_note", "")))[:500],
+            }
+        )
+
+    return validated
+
+
+_gemini_cursor = 0
+
+
+def analyze_and_rewrite(batch_posts, source_name):
+    global _gemini_cursor
+
+    if not GEMINI_API_KEYS:
+        raise RuntimeError("GEMINI_API_KEYS/GEMINI_API_KEY تنظیم نشده است.")
+
+    if not batch_posts:
+        return []
+
+    source_chunks = []
+    for index, post in enumerate(batch_posts, start=1):
+        published = post.get("published_at", "")
+        source_url = post.get("source_url", "")
+        text = post.get("text", "")
+
+        source_chunks.append(
+            f"[پست {index}]\n"
+            f"زمان: {published}\n"
+            f"لینک: {source_url}\n"
+            f"متن:\n{text}\n"
+        )
+
+    content = (
+        f"منبع: {source_name}\n"
+        f"این ورودی شامل {len(batch_posts)} پست است. "
+        f"اول تشخیص بده کدام‌ها یک رویداد مشترک‌اند و آن‌ها را ادغام کن.\n\n"
+        + "\n---\n".join(source_chunks)
+    )
+
+    prompt = REWRITE_PROMPT.format(
+        content=content,
+        source_name=source_name,
+    )
+
+    payload = {
+        "contents": [
+            {
+                "parts": [
+                    {
+                        "text": prompt,
+                    }
+                ]
+            }
+        ],
+        "generationConfig": {
+            "responseMimeType": "application/json",
+            "temperature": 0.2,
+        },
+    }
+
+    initialize_gemini_key_state_for_call = True
+    del initialize_gemini_key_state_for_call
+
+    # حداکثر چند دور کامل روی کلیدهای سالم.
+    total_attempts = max(1, len(GEMINI_API_KEYS) * 2)
+    last_error = None
+
+    for attempt in range(total_attempts):
+        available = choose_available_key(load_call_state_cache, _gemini_cursor)
+        if not available:
+            continue
+
+        idx, key = available[0]
+        _gemini_cursor = (idx + 1) % len(GEMINI_API_KEYS)
+
+        try:
+            headers = {
+                "Content-Type": "application/json",
+                "X-goog-api-key": key,
+            }
+
+            resp = requests.post(
+                GEMINI_API_URL,
+                headers=headers,
+                json=payload,
+                timeout=(15, 90),
+            )
+
+            status = resp.status_code
+
+            if status == 200:
+                set_key_success(load_call_state_cache, key)
+                data = resp.json()
+                candidates = data.get("candidates", [])
+                if not candidates:
+                    raise ValueError(f"پاسخ Gemini candidate ندارد: {data}")
+
+                parts = candidates[0].get("content", {}).get("parts", [])
+                raw = "\n".join(p.get("text", "") for p in parts).strip()
+                parsed = parse_json_response(raw)
+
+                items = parsed.get("items", [])
+                if not items and "relevant" in parsed:
+                    items = [parsed]
+
+                return validate_gemini_items(items)
+
+            if status == 429:
+                cooldown = retry_after_from_response(resp, 60)
+                set_key_failure(load_call_state_cache, key, status, cooldown)
+                log.warning(
+                    "کلید Gemini با 429 مواجه شد؛ کلید %s برای %s ثانیه cooldown شد.",
+                    key_id(key),
+                    cooldown,
+                )
+                continue
+
+            if status in (500, 502, 503, 504):
+                cooldown = min(120, 20 * (1 + attempt // max(1, len(GEMINI_API_KEYS))))
+                set_key_failure(load_call_state_cache, key, status, cooldown)
+                log.warning(
+                    "Gemini موقتاً خطا داد (%s)؛ کلید %s موقتاً کنار گذاشته شد.",
+                    status,
+                    key_id(key),
+                )
+                continue
+
+            if status in (401, 403):
+                # ممکن است کلید نامعتبر یا غیرفعال باشد؛ cooldown بلندتر تا در هر poll تکرار نشود.
+                set_key_failure(load_call_state_cache, key, status, 6 * 3600)
+                log.error(
+                    "کلید Gemini %s خطای %s داد؛ برای ۶ ساعت cooldown شد.",
+                    key_id(key),
+                    status,
+                )
+                continue
+
+            # خطاهای غیرقابل‌حل برای این درخواست.
+            raise RuntimeError(
+                f"Gemini HTTP {status}: {truncate_text(resp.text, 700)}"
+            )
+
+        except (requests.Timeout, requests.ConnectionError, requests.RequestException) as exc:
+            last_error = exc
+            # خطای شبکه به یک کلید خاص نسبت داده نمی‌شود؛ ولی کلید فعلی را کوتاه cooldown می‌کنیم
+            # تا در صورت مشکل شبکه از چرخش کلید بی‌مورد جلوگیری شود.
+            try:
+                set_key_failure(load_call_state_cache, key, -1, 30)
+            except Exception:
+                pass
+            log.warning(
+                "خطای شبکه هنگام اتصال به Gemini با کلید %s: %s",
+                key_id(key),
+                exc,
+            )
+            continue
+        except Exception as exc:
+            last_error = exc
+            log.error("خطا در پردازش پاسخ Gemini: %s", exc)
+            # خطای parse پاسخ به کلید ربطی ندارد؛ کلید را از چرخه خارج نمی‌کنیم.
+            continue
+
+    raise RuntimeError(
+        f"پس از {total_attempts} تلاش، Gemini موفق نشد. آخرین خطا: {last_error}"
+    )
+
+
+# این متغیر برای آن است که state فعلی به توابع Gemini که امضای قدیمی دارند برسد.
+load_call_state_cache = None
+
+
+def analyze_and_rewrite_safe(state, batch_posts, source_name):
+    global load_call_state_cache
+    load_call_state_cache = state
+    try:
+        return analyze_and_rewrite(batch_posts, source_name)
+    finally:
+        load_call_state_cache = None
+
+
+# ============================================================
+# Telegram public channel scraping
+# ============================================================
+
+def extract_telegram_posts_from_html(channel, html_text):
+    if BeautifulSoup is None:
+        raise RuntimeError("beautifulsoup4 نصب نیست.")
+
+    soup = BeautifulSoup(html_text, "html.parser")
+    nodes = soup.select("[data-post]")
+    posts = []
+
+    seen = set()
+
+    for node in nodes:
+        data_post = node.get("data-post", "")
+        expected_prefix = f"{channel}/"
+        if not data_post.startswith(expected_prefix):
+            continue
+
+        message_id = data_post[len(expected_prefix):]
+        if not message_id or message_id in seen:
+            continue
+        seen.add(message_id)
+
+        text_node = node.select_one(".tgme_widget_message_text")
+        text = text_node.get_text("\n", strip=True) if text_node else ""
+
+        time_node = node.select_one("time")
+        published_at = time_node.get("datetime") if time_node else ""
+
+        link_node = node.select_one(".tgme_widget_message_date")
+        source_url = None
+        if link_node is not None:
+            anchor = link_node.find("a")
+            if anchor and anchor.get("href"):
+                source_url = anchor["href"]
 
         photo_url = None
-        pm = re.search(
-            r'tgme_widget_message_photo_wrap[^"]*"\s+style="[^"]*'
-            r'background-image:url\(\'([^\']+)\'\)',
-            block,
-            flags=re.I,
-        )
-        if pm:
-            photo_url = html.unescape(pm.group(1))
+        photo_wrap = node.select_one(".tgme_widget_message_photo_wrap")
+        if photo_wrap:
+            style = photo_wrap.get("style", "")
+            m = re.search(
+                r"background-image:url\(['\"]?([^'\")]+)",
+                style,
+                flags=re.IGNORECASE,
+            )
+            if m:
+                photo_url = html.unescape(m.group(1))
 
         video_url = None
-        vm = re.search(
-            r'<video[^>]*class="[^"]*tgme_widget_message_video[^"]*"'
-            r'[^>]*src="([^"]+)"',
-            block,
-            flags=re.I,
-        )
-        if vm:
-            video_url = html.unescape(vm.group(1))
+        video_node = node.select_one("video")
+        if video_node and video_node.get("src"):
+            video_url = html.unescape(video_node["src"])
 
-        # لینک پست منبع
-        source_url = f"https://t.me/{channel}/{msg_id}"
-
-        # زمان پست
-        published_at = None
-        dm = re.search(
-            r'<time[^>]*datetime="([^"]+)"',
-            block,
-            flags=re.I,
-        )
-        if dm:
-            published_at = dm.group(1)
-
+        # پست‌های مدیا بدون متن هم نگه داشته می‌شوند.
         if text or photo_url or video_url:
             posts.append(
                 {
-                    "uid": f"tg:{channel}:{msg_id}",
-                    "source_key": f"tg:{channel}",
-                    "source_name": f"کانال {channel}",
+                    "uid": f"tg:{channel}:{message_id}",
                     "text": text,
+                    "title": text.split("\n", 1)[0][:220] if text else "",
                     "photo": photo_url,
                     "video": video_url,
-                    "source_url": source_url,
-                    "published_at": published_at,
+                    "source_name": f"کانال {channel}",
+                    "source_url": source_url or f"https://t.me/{channel}/{message_id}",
+                    "published_at": published_at or datetime.now(timezone.utc).isoformat(),
                 }
             )
 
     return posts
 
 
+def fetch_channel_posts(channel):
+    url = f"https://t.me/s/{channel}"
+    try:
+        resp = requests.get(
+            url,
+            timeout=(10, 30),
+            headers=HTTP_HEADERS,
+        )
+        resp.raise_for_status()
+        posts = extract_telegram_posts_from_html(channel, resp.text)
+        return posts
+    except Exception as exc:
+        log.warning("خطا در گرفتن کانال %s: %s", channel, exc)
+        return []
+
+
 # ============================================================
-# Website / RSS
+# Website/RSS extraction
 # ============================================================
 
-def fetch_og_image(article_url: str) -> Optional[str]:
-    if not article_url:
-        return None
+def extract_og_metadata(article_url):
+    if not article_url or BeautifulSoup is None:
+        return {}
+
     try:
         resp = requests.get(
             article_url,
-            timeout=HTTP_TIMEOUT,
-            headers={"User-Agent": USER_AGENT},
+            timeout=(10, 25),
+            headers=HTTP_HEADERS,
             allow_redirects=True,
         )
         resp.raise_for_status()
-        text = resp.text[:2_000_000]
 
-        patterns = [
-            r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)',
-            r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:image["\']',
-            r'<meta[^>]+name=["\']twitter:image["\'][^>]+content=["\']([^"\']+)',
-        ]
+        soup = BeautifulSoup(resp.text[:2_500_000], "html.parser")
+        result = {}
 
-        for pattern in patterns:
-            m = re.search(pattern, text, flags=re.I)
-            if m:
-                return urljoin(resp.url, html.unescape(m.group(1).strip()))
-    except requests.RequestException as exc:
-        log.debug("og:image ناموفق برای %s: %s", article_url, exc)
+        for prop, key in (
+            ("og:image", "image"),
+            ("og:title", "title"),
+            ("og:description", "description"),
+            ("article:published_time", "published_time"),
+            ("twitter:image", "twitter_image"),
+        ):
+            node = soup.find("meta", attrs={"property": prop})
+            if node and node.get("content"):
+                result[key] = node.get("content").strip()
+
+        if not result.get("image"):
+            node = soup.find("meta", attrs={"name": "twitter:image"})
+            if node and node.get("content"):
+                result["image"] = node["content"].strip()
+
+        base_tag = soup.find("base")
+        base_url = base_tag.get("href") if base_tag and base_tag.get("href") else article_url
+
+        if result.get("image"):
+            result["image"] = urljoin(base_url, result["image"])
+
+        # متن مقاله فقط وقتی RSS ضعیف است استخراج می‌شود.
+        paragraphs = []
+        article_root = (
+            soup.find("article")
+            or soup.find(attrs={"itemprop": "articleBody"})
+            or soup
+        )
+        for p in article_root.find_all("p")[:80]:
+            txt = normalize_space(p.get_text(" ", strip=True))
+            if len(txt) >= 30:
+                paragraphs.append(txt)
+
+        result["article_text"] = "\n\n".join(paragraphs[:30])
+        return result
+
+    except Exception as exc:
+        log.info("دریافت metadata/article برای %s ناموفق بود: %s", article_url, exc)
+        return {}
+
+
+def get_entry_datetime(entry):
+    for key in ("published_parsed", "updated_parsed", "created_parsed"):
+        value = entry.get(key)
+        dt = parse_datetime_from_struct(value)
+        if dt:
+            return dt
+
+    raw = (
+        entry.get("published")
+        or entry.get("updated")
+        or entry.get("created")
+        or ""
+    )
+    if raw:
+        try:
+            from email.utils import parsedate_to_datetime
+            dt = parsedate_to_datetime(raw)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone.utc)
+        except Exception:
+            pass
+
+    return datetime.now(timezone.utc)
+
+
+def extract_entry_image(entry):
+    for field in ("media_content", "media_thumbnail"):
+        values = entry.get(field)
+        if values:
+            for obj in values:
+                url = obj.get("url")
+                if url:
+                    return url
+
+    for link in entry.get("links", []) or []:
+        typ = (link.get("type") or "").lower()
+        href = link.get("href")
+        if href and typ.startswith("image"):
+            return href
+
+    enclosure = entry.get("enclosures", []) or []
+    for obj in enclosure:
+        href = obj.get("href")
+        typ = (obj.get("type") or "").lower()
+        if href and typ.startswith("image"):
+            return href
+
     return None
 
 
-def fetch_website_posts(feed_url: str) -> List[Dict[str, Any]]:
+def fetch_website_posts(feed_url):
     if feedparser is None:
         log.error("feedparser نصب نیست.")
         return []
@@ -474,1178 +1326,1028 @@ def fetch_website_posts(feed_url: str) -> List[Dict[str, Any]]:
     try:
         parsed = feedparser.parse(feed_url)
     except Exception as exc:
-        log.warning("خطا در RSS %s: %s", feed_url, exc)
+        log.warning("خواندن RSS شکست خورد: %s", exc)
         return []
 
+    feed_title = (
+        parsed.feed.get("title")
+        if getattr(parsed, "feed", None)
+        else feed_url
+    ) or feed_url
+
     posts = []
-    feed_title = parsed.feed.get("title", feed_url)
 
-    for entry in parsed.entries[:50]:
-        link = entry.get("link", "")
-        uid = f"web:{feed_url}:{entry.get('id') or link or entry.get('title', '')}"
-        title = clean_html_text(entry.get("title", ""))
-        summary = clean_html_text(
-            entry.get("summary", "") or entry.get("description", "")
-        )
+    for entry in parsed.entries[:30]:
+        entry_id = entry.get("id") or entry.get("guid") or entry.get("link")
+        link = entry.get("link") or ""
 
-        # اگر RSS content:encoded داشته باشد، آن را بر summary ترجیح می‌دهیم.
-        content_value = ""
-        content_list = entry.get("content") or []
-        if content_list:
-            try:
-                content_value = clean_html_text(content_list[0].get("value", ""))
-            except Exception:
-                content_value = ""
+        uid = f"web:{feed_url}:{entry_id}"
 
-        article_text = content_value or summary
-        text = f"{title}\n\n{article_text}".strip()
+        title = normalize_space(entry.get("title", ""))
+        summary = entry.get("summary", "") or entry.get("description", "")
+        summary = clean_text(summary)
 
-        photo_url = None
-        for key in ("media_content", "media_thumbnail"):
-            values = entry.get(key)
-            if values:
-                try:
-                    photo_url = values[0].get("url")
-                except Exception:
-                    pass
-                if photo_url:
-                    break
+        photo_url = extract_entry_image(entry)
+        published_dt = get_entry_datetime(entry)
+
+        # اگر RSS خیلی خلاصه است یا عکس ندارد، صفحه مقاله را بررسی کن.
+        article_meta = {}
+        if link and (len(summary) < 220 or not photo_url):
+            article_meta = extract_og_metadata(link)
 
         if not photo_url:
-            for link_item in entry.get("links", []) or []:
-                if str(link_item.get("type", "")).startswith("image"):
-                    photo_url = link_item.get("href")
-                    break
+            photo_url = article_meta.get("image")
 
-        if not photo_url and link:
-            photo_url = fetch_og_image(link)
+        if len(summary) < 220 and article_meta.get("article_text"):
+            summary = article_meta["article_text"]
 
-        if text or photo_url:
-            posts.append(
-                {
-                    "uid": uid,
-                    "source_key": f"web:{feed_url}",
-                    "source_name": feed_title,
-                    "text": text,
-                    "photo": photo_url,
-                    "video": None,
-                    "source_url": link,
-                    "published_at": parse_feed_time(entry),
-                }
-            )
+        final_title = title or article_meta.get("title", "")
+        content = f"{final_title}\n\n{summary}".strip()
+
+        if not content:
+            continue
+
+        posts.append(
+            {
+                "uid": uid,
+                "text": content,
+                "title": final_title[:220],
+                "photo": photo_url,
+                "video": None,
+                "source_name": feed_title,
+                "source_url": canonical_url(link),
+                "published_at": published_dt.isoformat(),
+                "article_image": photo_url,
+            }
+        )
 
     return posts
 
 
 # ============================================================
-# ثبت و دریافت آیتم‌های منبع
+# Image search / image acquisition
 # ============================================================
 
-def source_exists(uid: str) -> bool:
-    with db_connect() as conn:
-        return conn.execute(
-            "SELECT 1 FROM source_items WHERE uid=?",
-            (uid,),
-        ).fetchone() is not None
+def find_wikimedia_image(query):
+    """
+    fallback بدون API key:
+    Wikimedia Commons MediaSearch
+    """
+    if not query:
+        return None
 
+    try:
+        params = {
+            "action": "query",
+            "generator": "search",
+            "gsrsearch": query,
+            "gsrnamespace": 6,
+            "gsrlimit": 8,
+            "prop": "imageinfo",
+            "iiprop": "url|mime|size",
+            "format": "json",
+        }
 
-def save_source_item(post: Dict[str, Any]) -> None:
-    with db_connect() as conn:
-        conn.execute(
-            """
-            INSERT OR IGNORE INTO source_items
-            (uid,source_key,source_name,published_at,discovered_at,text,
-             photo_url,video_url,source_url,status)
-            VALUES(?,?,?,?,?,?,?,?,?,?)
-            """,
-            (
-                post["uid"],
-                post["source_key"],
-                post["source_name"],
-                post.get("published_at"),
-                now_utc().isoformat(),
-                post.get("text", ""),
-                post.get("photo"),
-                post.get("video"),
-                post.get("source_url"),
-                "new",
-            ),
+        resp = requests.get(
+            "https://commons.wikimedia.org/w/api.php",
+            params=params,
+            timeout=(10, 25),
+            headers=HTTP_HEADERS,
         )
+        resp.raise_for_status()
+
+        data = resp.json()
+        pages = list((data.get("query") or {}).get("pages", {}).values())
+
+        # فقط تصاویر رایج را برگردان.
+        allowed = {"image/jpeg", "image/png", "image/webp"}
+
+        candidates = []
+        for page in pages:
+            infos = page.get("imageinfo") or []
+            if not infos:
+                continue
+            info = infos[0]
+            url = info.get("thumburl") or info.get("url")
+            mime = info.get("mime")
+            width = safe_int(info.get("width"), 0)
+
+            if url and (mime in allowed or not mime):
+                candidates.append((width, url))
+
+        candidates.sort(reverse=True)
+
+        if candidates:
+            return candidates[0][1]
+
+    except Exception as exc:
+        log.info("Wikimedia image search failed: %s", exc)
+
+    return None
 
 
-def mark_source_status(uid: str, status: str, error: str = "") -> None:
-    with db_connect() as conn:
-        conn.execute(
-            """
-            UPDATE source_items
-            SET status=?, attempts=attempts+1, last_error=?
-            WHERE uid=?
-            """,
-            (status, error[:1000], uid),
-        )
+def image_query_from_item(item):
+    query = normalize_space(item.get("image_query", ""))
+    if query:
+        return query
+
+    title = item.get("title", "")
+    # query ساده برای fallback.
+    return " ".join(title.split()[:6])
 
 
-def get_new_source_items(limit: int = 100) -> List[Dict[str, Any]]:
-    with db_connect() as conn:
-        rows = conn.execute(
-            """
-            SELECT * FROM source_items
-            WHERE status='new'
-            ORDER BY
-              CASE WHEN published_at IS NULL THEN discovered_at
-                   ELSE published_at END ASC
-            LIMIT ?
-            """,
-            (limit,),
-        ).fetchall()
-    return [dict(r) for r in rows]
+def choose_image_url(item, original_posts):
+    """
+    اولویت:
+      1) تصویر اصلی منبع
+      2) og:image مقاله
+      3) رسانه پست
+      4) Wikimedia fallback
+      5) None
+    """
+    for post in original_posts:
+        if post.get("photo"):
+            return post["photo"]
 
+    for post in original_posts:
+        if post.get("article_image"):
+            return post["article_image"]
 
-# ============================================================
-# Gemini key manager
-# ============================================================
-
-class GeminiKeyManager:
-    def __init__(self, keys: List[str]):
-        self.keys = keys
-        self.cooldowns: Dict[int, float] = {}
-        self.cursor = 0
-
-    def available_indices(self) -> List[int]:
-        now = time.time()
-        return [
-            i for i in range(len(self.keys))
-            if self.cooldowns.get(i, 0) <= now
-        ]
-
-    def next_key(self) -> Tuple[int, str]:
-        available = self.available_indices()
-        if not available:
-            soonest = min(
-                self.cooldowns.items(),
-                key=lambda item: item[1]
-            )
-            wait = max(0, soonest[1] - time.time())
-            log.warning(
-                "همه کلیدهای Gemini در cooldown هستند؛ %.1f ثانیه صبر می‌کنیم.",
-                wait,
-            )
-            time.sleep(min(wait, 120))
-            available = self.available_indices() or [soonest[0]]
-
-        # Round-robin فقط میان کلیدهای قابل استفاده
-        for _ in range(len(self.keys)):
-            idx = self.cursor % len(self.keys)
-            self.cursor += 1
-            if idx in available:
-                return idx, self.keys[idx]
-
-        idx = available[0]
-        return idx, self.keys[idx]
-
-    def cooldown(self, index: int, seconds: int) -> None:
-        self.cooldowns[index] = time.time() + seconds
-
-
-gemini_keys = GeminiKeyManager(GEMINI_API_KEYS)
+    # فقط عکس عمومی موضوعی، نه ادعای عکس همان واقعه.
+    query = image_query_from_item(item)
+    return find_wikimedia_image(query)
 
 
 # ============================================================
-# Prompt
+# Media streaming
 # ============================================================
 
-BATCH_PROMPT = r"""
-تو سردبیر ارشد یک کانال تلگرامی تخصصی حوزه دفاع، تسلیحات، هوافضا و ژئوپلیتیک هستی.
+def stream_download_to_temp(url, max_bytes, timeout, suffix):
+    if not url:
+        raise ValueError("URL رسانه خالی است.")
 
-ورودی شامل چند پست پشت سرهم از یک منبع است. هدف این نیست که هر پست را جداگانه بازنویسی کنی.
-اول تشخیص بده کدام پست‌ها واقعاً درباره یک رویداد یا زنجیره واحد هستند.
+    response = requests.get(
+        url,
+        stream=True,
+        timeout=(10, timeout),
+        headers=HTTP_HEADERS,
+        allow_redirects=True,
+    )
+    response.raise_for_status()
 
-قواعد بسیار مهم:
-
-1. پست‌هایی که درباره یک رویداد واحد هستند باید در یک گروه قرار بگیرند.
-   مثال: اعلام حمله، تصاویر همان حمله، گزارش خسارت همان حمله و واکنش رسمی همان رویداد
-   نباید چهار پست جداگانه شوند.
-
-2. اگر یک منبع در فاصله کوتاه چندین آپدیت درباره یک واقعه منتشر کرده، همه را تا حد امکان
-   در یک جمع‌بندی واحد ادغام کن. اگر حجم اطلاعات واقعاً زیاد است، حداکثر 2 پست مستقل
-   برای همان واقعه تولید کن، نه ده‌ها پست کوتاه.
-
-3. خبرهای مستقل را با هم ادغام نکن. مثلاً خبر یک جنگنده جدید و خبر یک ناو جدید دو رویداد
-   متفاوت‌اند، حتی اگر در یک روز منتشر شده باشند.
-
-4. محتوای تبلیغاتی، غیرمرتبط، تکراری یا فاقد ارزش خبری را حذف کن.
-
-5. هیچ واقعیت، عدد، نام سامانه، کشور، مکان، تاریخ یا ادعای اصلی را تغییر نده.
-   اگر چیزی ادعا یا تأییدنشده است، صریحاً با عباراتی مانند «بر اساس گزارش‌ها»،
-   «به گفته...» یا «در صورت تأیید» بنویس.
-
-6. بازنویسی باید فارسی طبیعی، حرفه‌ای، خبری و کوتاه باشد؛ ترجمه تحت‌اللفظی نباشد.
-
-7. تیتر کوتاه و جدی باشد؛ از اغراق و عبارات زرد استفاده نکن.
-
-8. اولویت:
-   - رویداد نظامی، حمله، درگیری، جنگ یا تحول عملیاتی مهم: بالاترین اولویت
-   - خاورمیانه: اولویت بالا
-   - ایران: بالاترین اولویت در داخل پوشش منطقه‌ای
-   - قدرت‌های بزرگ نظامی جهان: مهم
-   - سایر نقاط جهان: همچنان پوشش داده شوند و برای تنوع وارد صف شوند
-
-9. urgent فقط وقتی true است که خبر واقعاً نیازمند انتشار فوری باشد؛
-   مثل حمله نظامی جاری، شروع درگیری مهم، اعلام عملیات، تحول فوری و مشابه آن.
-   خبر عادی هرگز urgent نیست.
-
-10. important یعنی خبر نسبت به اخبار روزمره اهمیت بیشتری دارد ولی الزاماً فوری نیست.
-
-11. region را فقط یکی از این مقادیر قرار بده:
-   iran, middle_east, great_power, other
-
-12. event_type را فقط یکی از این مقادیر قرار بده:
-   conflict, strike, military_operation, weapons, procurement, test,
-   defense_industry, aircraft, naval, air_defense, geopolitical, other
-
-13. event_key یک شناسه کوتاه و پایدار برای رویداد باشد؛ مثلاً:
-   iran-israel-missile-strike
-   us-patriot-europe-deployment
-   اگر دو خبر رویداد یکسان دارند، event_key یکسان بده.
-
-14. هر گروه فقط در صورت relevant=true خروجی شود.
-
-15. خروجی فقط JSON معتبر باشد و هیچ Markdown یا توضیح اضافه نداشته باشد.
-
-فرمت:
-{
-  "groups": [
-    {
-      "relevant": true,
-      "event_key": "short-event-key",
-      "region": "iran",
-      "event_type": "strike",
-      "urgent": false,
-      "important": true,
-      "source_uids": ["..."],
-      "title": "تیتر",
-      "body": "جمع‌بندی کامل و کوتاه",
-      "facts": [
-        "واقعیت مهم اول",
-        "واقعیت مهم دوم"
-      ]
-    }
-  ]
-}
-
-پست‌های ورودی:
----
-{items_json}
----
-"""
-
-
-def gemini_request(prompt: str, max_attempts: int = 4) -> Dict[str, Any]:
-    if not gemini_keys.keys:
-        raise RuntimeError("هیچ GEMINI_API_KEY یا GEMINI_API_KEYS تنظیم نشده است.")
-
-    payload = {
-        "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {
-            "responseMimeType": "application/json",
-            "temperature": 0.2,
-        },
-    }
-
-    last_error = None
-
-    for attempt in range(max_attempts):
-        index, key = gemini_keys.next_key()
-
+    content_length = response.headers.get("Content-Length")
+    if content_length:
         try:
-            resp = requests.post(
-                GEMINI_API_URL,
-                headers={
-                    "Content-Type": "application/json",
-                    "X-goog-api-key": key,
+            content_length_int = int(content_length)
+        except (TypeError, ValueError):
+            content_length_int = None
+        if content_length_int is not None and content_length_int > max_bytes:
+            raise ValueError(
+                f"رسانه از حد مجاز بزرگ‌تر است: {content_length_int} bytes"
+            )
+
+    fd, path = tempfile.mkstemp(prefix="media-", suffix=suffix)
+    os.close(fd)
+
+    written = 0
+
+    try:
+        with open(path, "wb") as out:
+            for chunk in response.iter_content(chunk_size=64 * 1024):
+                if not chunk:
+                    continue
+                written += len(chunk)
+                if written > max_bytes:
+                    raise ValueError(
+                        f"رسانه از حد مجاز بزرگ‌تر است: {written} bytes"
+                    )
+                out.write(chunk)
+
+        return path, written
+    except Exception:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        raise
+
+
+# ============================================================
+# Telegram API
+# ============================================================
+
+class TelegramAPIError(RuntimeError):
+    def __init__(self, status_code, description, retry_after=0):
+        super().__init__(f"Telegram HTTP {status_code}: {description}")
+        self.status_code = status_code
+        self.description = description
+        self.retry_after = retry_after
+
+
+def telegram_request(method, data=None, files=None, timeout=30):
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
+
+    response = requests.post(
+        url,
+        data=data,
+        files=files,
+        timeout=timeout,
+    )
+
+    try:
+        payload = response.json()
+    except ValueError:
+        payload = {}
+
+    if response.status_code == 429:
+        retry_after = (
+            payload.get("parameters", {}).get("retry_after")
+            or response.headers.get("Retry-After")
+            or 30
+        )
+        raise TelegramAPIError(
+            response.status_code,
+            payload.get("description", response.text[:500]),
+            int(retry_after),
+        )
+
+    if not response.ok or payload.get("ok") is False:
+        raise TelegramAPIError(
+            response.status_code,
+            payload.get("description", response.text[:500]),
+        )
+
+    return payload
+
+
+def send_text_to_telegram(text):
+    # plain text: هیچ مشکل HTML/Markdown ندارد.
+    payload = {
+        "chat_id": TARGET_CHAT_ID,
+        "text": text,
+        "disable_web_page_preview": False,
+    }
+
+    try:
+        return telegram_request(
+            "sendMessage",
+            data=payload,
+            timeout=30,
+        )
+    except TelegramAPIError as exc:
+        if exc.status_code == 429:
+            log.warning(
+                "Telegram rate limit؛ %s ثانیه صبر می‌کنیم.",
+                exc.retry_after,
+            )
+            time.sleep(exc.retry_after)
+            return telegram_request(
+                "sendMessage",
+                data=payload,
+                timeout=30,
+            )
+        raise
+
+
+def split_media_caption(title, body, footer, max_chars=1024):
+    first = normalize_space(title)
+    rest = body.strip()
+
+    caption = first[:max_chars]
+    remaining_body = rest
+
+    if remaining_body:
+        room = max_chars - len(caption) - 2
+        if room > 120:
+            body_part = truncate_text(remaining_body, room)
+            caption = f"{caption}\n\n{body_part}"
+            remaining_body = remaining_body[len(body_part.rstrip("…")):].lstrip()
+
+    # Footer را در پیام متنی کامل می‌گذاریم تا کپشن بیش از حد طولانی نشود.
+    remaining = remaining_body
+    if remaining:
+        remaining = f"{remaining}\n\n{footer}"
+    else:
+        # اگر همه body داخل کپشن جا شد، footer را با پیام body کوچک ادغام می‌کنیم.
+        remaining = footer
+
+    return caption[:max_chars], remaining
+
+
+def send_photo_to_telegram(title, body, photo_url):
+    caption, remainder = split_media_caption(
+        title,
+        body,
+        FOOTER,
+        max_chars=1024,
+    )
+
+    temp_path = None
+    try:
+        temp_path, _ = stream_download_to_temp(
+            photo_url,
+            max_bytes=MAX_IMAGE_BYTES,
+            timeout=45,
+            suffix=".jpg",
+        )
+
+        with open(temp_path, "rb") as photo_file:
+            telegram_request(
+                "sendPhoto",
+                data={
+                    "chat_id": TARGET_CHAT_ID,
+                    "caption": caption[:1024],
                 },
-                json=payload,
+                files={
+                    "photo": (
+                        "photo.jpg",
+                        photo_file,
+                        "image/jpeg",
+                    )
+                },
                 timeout=90,
             )
 
-            status = resp.status_code
-
-            if status == 429:
-                retry_after = 30
-                try:
-                    body = resp.json()
-                    retry_after = int(
-                        body.get("error", {})
-                        .get("details", [{}])[0]
-                        .get("retryDelay", "30s")
-                        .rstrip("s")
-                    )
-                except Exception:
-                    pass
-
-                gemini_keys.cooldown(index, max(30, min(retry_after, 3600)))
-                last_error = RuntimeError("Gemini 429 rate limit")
-                continue
-
-            if status in (500, 502, 503, 504):
-                gemini_keys.cooldown(index, min(60 * (attempt + 1), 300))
-                last_error = RuntimeError(f"Gemini server error {status}")
-                continue
-
-            resp.raise_for_status()
-            data = resp.json()
-
-            candidates = data.get("candidates", [])
-            if not candidates:
-                raise ValueError(f"Gemini پاسخ خالی داد: {data}")
-
-            parts = candidates[0].get("content", {}).get("parts", [])
-            raw = "\n".join(
-                p.get("text", "") for p in parts if p.get("text")
-            ).strip()
-
-            if not raw:
-                raise ValueError("Gemini متن خروجی نداشت.")
-
+    finally:
+        if temp_path and os.path.exists(temp_path):
             try:
-                parsed = json.loads(raw)
-            except json.JSONDecodeError:
-                match = re.search(r"\{.*\}", raw, re.DOTALL)
-                if not match:
-                    raise ValueError("JSON خروجی Gemini قابل parse نیست.")
-                parsed = json.loads(match.group(0))
+                os.unlink(temp_path)
+            except OSError:
+                pass
 
-            return parsed
-
-        except (requests.Timeout, requests.ConnectionError) as exc:
-            gemini_keys.cooldown(index, min(30 * (attempt + 1), 180))
-            last_error = exc
-            continue
-        except requests.HTTPError as exc:
-            last_error = exc
-            continue
-
-    raise RuntimeError(f"Gemini بعد از چند تلاش ناموفق بود: {last_error}")
+    # اگر متن کامل در caption جا نشده یا برای footer.
+    if remainder:
+        send_text_to_telegram(remainder)
 
 
-def build_batch_input(items: List[Dict[str, Any]]) -> str:
-    clean = []
-    for item in items:
-        clean.append(
-            {
-                "uid": item["uid"],
-                "source_name": item["source_name"],
-                "published_at": item.get("published_at"),
-                "source_url": item.get("source_url"),
-                "text": trim_text(item.get("text", ""), 8000),
-            }
+def send_video_to_telegram(title, body, video_url):
+    caption, remainder = split_media_caption(
+        title,
+        body,
+        FOOTER,
+        max_chars=1024,
+    )
+
+    temp_path = None
+    try:
+        temp_path, _ = stream_download_to_temp(
+            video_url,
+            max_bytes=MAX_VIDEO_BYTES,
+            timeout=120,
+            suffix=".mp4",
         )
-    return json.dumps(clean, ensure_ascii=False)
+
+        with open(temp_path, "rb") as video_file:
+            telegram_request(
+                "sendVideo",
+                data={
+                    "chat_id": TARGET_CHAT_ID,
+                    "caption": caption[:1024],
+                    "supports_streaming": "true",
+                },
+                files={
+                    "video": (
+                        "video.mp4",
+                        video_file,
+                        "video/mp4",
+                    )
+                },
+                timeout=180,
+            )
+
+    finally:
+        if temp_path and os.path.exists(temp_path):
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                pass
+
+    if remainder:
+        send_text_to_telegram(remainder)
 
 
-def analyze_batch(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    if not items:
-        return []
+def build_text_only_message(item):
+    title = normalize_space(item.get("title", ""))
+    body = (item.get("body", "") or "").strip()
+    source_note = (item.get("source_note", "") or "").strip()
+    source_url = item.get("source_url", "")
 
-    # از str.format استفاده نمی‌کنیم چون خود prompt شامل JSON و آکولاد است.
-    # فقط placeholder مشخص را جایگزین می‌کنیم تا خطای KeyError مثل 'groups' ایجاد نشود.
-    prompt = BATCH_PROMPT.replace("{items_json}", build_batch_input(items))
-    result = gemini_request(prompt)
-    groups = result.get("groups", [])
+    parts = []
+    if title:
+        parts.append(title)
+    if body:
+        parts.append(body)
+    if source_note:
+        parts.append(f"یادداشت منبع: {source_note}")
+    if source_url:
+        parts.append(format_source_link("منبع", source_url))
+    parts.append(FOOTER)
 
-    if not isinstance(groups, list):
-        raise ValueError("ساختار groups در پاسخ Gemini معتبر نیست.")
-
-    return groups
-
-
-# ============================================================
-# اعتبارسنجی خروجی
-# ============================================================
-
-VALID_REGIONS = {"iran", "middle_east", "great_power", "other"}
-VALID_EVENT_TYPES = {
-    "conflict", "strike", "military_operation", "weapons", "procurement",
-    "test", "defense_industry", "aircraft", "naval", "air_defense",
-    "geopolitical", "other",
-}
+    return "\n\n".join(parts)
 
 
-def validate_group(group: Dict[str, Any], known_uids: set) -> Optional[Dict[str, Any]]:
-    if not isinstance(group, dict):
-        return None
+def dispatch_item(item):
+    title = normalize_space(item.get("title", ""))
+    body = (item.get("body", "") or "").strip()
+    source_note = (item.get("source_note", "") or "").strip()
+    source_url = item.get("source_url", "")
+    photo = item.get("photo")
+    video = item.get("video")
 
-    if not bool(group.get("relevant")):
-        return None
+    media_body_parts = [body]
+    if source_note:
+        media_body_parts.append(f"یادداشت منبع: {source_note}")
+    if source_url:
+        media_body_parts.append(format_source_link("منبع", source_url))
+    media_body = "\n\n".join(x for x in media_body_parts if x)
 
-    title = trim_text(str(group.get("title") or "").strip(), 180)
-    body = str(group.get("body") or "").strip()
+    if video:
+        try:
+            send_video_to_telegram(title, media_body, video)
+            return True
+        except TelegramAPIError:
+            raise
+        except Exception as exc:
+            log.warning("ارسال ویدیو شکست خورد؛ به عکس/متن fallback می‌کنیم: %s", exc)
 
-    if not title or not body:
-        return None
+    if photo:
+        try:
+            send_photo_to_telegram(title, media_body, photo)
+            return True
+        except TelegramAPIError:
+            raise
+        except Exception as exc:
+            log.warning("ارسال عکس شکست خورد؛ به متن fallback می‌کنیم: %s", exc)
 
-    source_uids = group.get("source_uids") or []
-    if not isinstance(source_uids, list):
-        source_uids = []
-
-    source_uids = [str(x) for x in source_uids if str(x) in known_uids]
-    if not source_uids:
-        return None
-
-    region = str(group.get("region") or "other")
-    if region not in VALID_REGIONS:
-        region = "other"
-
-    event_type = str(group.get("event_type") or "other")
-    if event_type not in VALID_EVENT_TYPES:
-        event_type = "other"
-
-    event_key = re.sub(
-        r"[^a-zA-Z0-9_-]+", "-", str(group.get("event_key") or "unknown")
-    ).strip("-")[:120] or "unknown"
-
-    urgent = bool(group.get("urgent"))
-    important = bool(group.get("important"))
-
-    # اگر urgent است، important نیز منطقا باید در اولویت بالا قرار گیرد.
-    if urgent:
-        important = True
-
-    return {
-        "title": title,
-        "body": body,
-        "source_uids": source_uids,
-        "region": region,
-        "event_type": event_type,
-        "event_key": event_key,
-        "urgent": urgent,
-        "important": important,
-    }
-
-
-# ============================================================
-# اولویت‌بندی
-# ============================================================
-
-def calculate_priority(group: Dict[str, Any]) -> int:
-    """
-    عدد بزرگ‌تر = اولویت بالاتر.
-    این امتیاز برای مرتب‌سازی است و نه زمان دقیق انتشار.
-    """
-
-    event_type = group.get("event_type", "other")
-    region = group.get("region", "other")
-    urgent = bool(group.get("urgent"))
-    important = bool(group.get("important"))
-
-    score = 50
-
-    # 1) رویدادهای نظامی
-    if event_type in {
-        "conflict", "strike", "military_operation"
-    }:
-        score += 40
-    elif event_type in {
-        "weapons", "air_defense", "aircraft", "naval",
-        "defense_industry", "test", "procurement"
-    }:
-        score += 20
-
-    # 2) ایران
-    if region == "iran":
-        score += 35
-
-    # 3) خاورمیانه
-    elif region == "middle_east":
-        score += 25
-
-    # 4) قدرت‌های بزرگ
-    elif region == "great_power":
-        score += 15
-
-    # 5) important
-    if important:
-        score += 15
-
-    # urgent جداگانه نگه داشته می‌شود، ولی امتیاز هم می‌گیرد.
-    if urgent:
-        score += 100
-
-    return score
+    send_text_to_telegram(build_text_only_message(item))
+    return True
 
 
 # ============================================================
-# Duplicate / Event merge
+# Dedup / event memory
 # ============================================================
 
-def recent_posted_titles() -> List[Dict[str, Any]]:
+def purge_recent_memories(state):
     cutoff = now_ts() - DEDUP_WINDOW_MINUTES * 60
-    with db_connect() as conn:
-        rows = conn.execute(
-            """
-            SELECT title,event_key,posted_at
-            FROM posted_events
-            WHERE posted_at >= ?
-            ORDER BY posted_at DESC
-            LIMIT 300
-            """,
-            (cutoff,),
-        ).fetchall()
-    return [dict(r) for r in rows]
+
+    state["_recent_titles"] = [
+        x for x in state.get("_recent_titles", [])
+        if x.get("ts", 0) >= cutoff
+    ][-400:]
+
+    state["_recent_events"] = [
+        x for x in state.get("_recent_events", [])
+        if x.get("ts", 0) >= cutoff
+    ][-400:]
 
 
-def is_recent_duplicate(title: str, event_key: str) -> bool:
-    for row in recent_posted_titles():
-        if event_key and row.get("event_key") and event_key == row["event_key"]:
+def is_duplicate(state, title, body):
+    purge_recent_memories(state)
+
+    for recent in state.get("_recent_titles", []):
+        ts = recent.get("ts", 0)
+        if now_ts() - ts > DEDUP_WINDOW_MINUTES * 60:
+            continue
+
+        old_title = recent.get("title", "")
+        old_body = recent.get("body", "")
+        sim = combined_similarity(title, body, old_title, old_body)
+
+        if sim >= DEDUP_SIMILARITY_THRESHOLD:
             return True
-        if title_similarity(title, row["title"]) >= DEDUP_SIMILARITY_THRESHOLD:
+
+    # event fingerprints
+    current_tokens = tokens(f"{title} {body}")
+    for event in state.get("_recent_events", []):
+        event_tokens = set(event.get("tokens", []))
+        if not current_tokens or not event_tokens:
+            continue
+
+        overlap = len(current_tokens & event_tokens) / max(
+            1, len(current_tokens | event_tokens)
+        )
+
+        if overlap >= 0.48:
             return True
+
     return False
 
 
-def remember_posted_event(title: str, event_key: str) -> None:
-    with db_connect() as conn:
-        conn.execute(
-            "INSERT INTO posted_events(title,event_key,posted_at) VALUES(?,?,?)",
-            (title, event_key, now_ts()),
-        )
+def remember_item(state, item):
+    purge_recent_memories(state)
 
+    title = item.get("title", "")
+    body = item.get("body", "")
 
-def merge_same_event_groups(groups: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    اگر Gemini به هر دلیل دو گروه با event_key یکسان برگرداند، آن‌ها را قبل از صف
-    تا حد امکان یکی می‌کند.
-    """
-    result: List[Dict[str, Any]] = []
-    index: Dict[str, int] = {}
+    state["_recent_titles"].append(
+        {
+            "title": title,
+            "body": body,
+            "ts": now_ts(),
+        }
+    )
 
-    for group in groups:
-        key = group["event_key"]
-        if key not in index:
-            index[key] = len(result)
-            result.append(group)
-            continue
+    state["_recent_events"].append(
+        {
+            "tokens": list(tokens(f"{title} {body}"))[:80],
+            "region": item.get("region", "world"),
+            "ts": now_ts(),
+        }
+    )
 
-        old = result[index[key]]
-        old["source_uids"] = list(
-            dict.fromkeys(old["source_uids"] + group["source_uids"])
-        )
-        if len(old["body"]) < 6000:
-            old["body"] = old["body"].rstrip() + "\n\n" + group["body"].lstrip()
-        old["urgent"] = old["urgent"] or group["urgent"]
-        old["important"] = old["important"] or group["important"]
-
-    return result
+    state["_recent_titles"] = state["_recent_titles"][-400:]
+    state["_recent_events"] = state["_recent_events"][-400:]
 
 
 # ============================================================
 # Queue
 # ============================================================
 
-def enqueue_group(group: Dict[str, Any], label: str = "news") -> bool:
-    if is_recent_duplicate(group["title"], group["event_key"]):
-        log.info("Duplicate رد شد: %s", group["title"])
+def item_fingerprint(item):
+    base = normalize_for_match(
+        f"{item.get('title','')} {item.get('body','')[:600]}"
+    )
+    return sha1_text(base)[:20]
+
+
+def enqueue_item(state, item):
+    queue = state.setdefault("_pending_queue", [])
+    fp = item_fingerprint(item)
+
+    # از ثبت دوباره همان آیتم در صف جلوگیری کن.
+    if any(x.get("fingerprint") == fp for x in queue):
         return False
 
-    photo_url = None
-    video_url = None
+    item = dict(item)
+    item["fingerprint"] = fp
+    item.setdefault("queued_at", now_ts())
+    item.setdefault("important", False)
+    item.setdefault("urgent", False)
+    item.setdefault("region", "world")
 
-    # media از اولین source item گروه
-    with db_connect() as conn:
-        placeholders = ",".join("?" for _ in group["source_uids"])
-        rows = conn.execute(
-            f"""
-            SELECT photo_url,video_url,published_at
-            FROM source_items
-            WHERE uid IN ({placeholders})
-            ORDER BY CASE WHEN published_at IS NULL THEN 1 ELSE 0 END,
-                     published_at ASC
-            """,
-            tuple(group["source_uids"]),
-        ).fetchall()
+    apply_queue_diversity_score(state, item)
 
-    for row in rows:
-        if not photo_url and row["photo_url"]:
-            photo_url = row["photo_url"]
-        if not video_url and row["video_url"]:
-            video_url = row["video_url"]
+    queue.append(item)
 
-    priority = calculate_priority(group)
+    # صف را مرتب نگه می‌داریم؛ اما برای تنوع فقط tie-breaker استفاده می‌شود.
+    queue.sort(
+        key=lambda x: (
+            bool(x.get("urgent")),
+            x.get("priority_score", 0),
+            x.get("queued_at", 0),
+        ),
+        reverse=True,
+    )
 
-    with db_connect() as conn:
-        conn.execute(
-            """
-            INSERT INTO queue
-            (title,body,photo_url,video_url,label,priority,urgent,important,
-             region,event_key,source_time,queued_at,available_at)
-            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
-            """,
-            (
-                group["title"],
-                group["body"],
-                photo_url,
-                video_url,
-                label,
-                priority,
-                int(group["urgent"]),
-                int(group["important"]),
-                group["region"],
-                group["event_key"],
-                None,
-                now_ts(),
-                now_ts(),
-            ),
-        )
-
+    # حداکثر اندازه صف.
+    state["_pending_queue"] = queue[-500:]
+    save_state(state)
     return True
 
 
-def queue_count() -> int:
-    with db_connect() as conn:
-        return int(conn.execute("SELECT COUNT(*) FROM queue").fetchone()[0])
-
-
-def choose_next_queue_item() -> Optional[Dict[str, Any]]:
+def compute_dynamic_spacing_minutes(queue_len):
     """
-    اولویت‌بندی با تنوع جغرافیایی:
-    - urgent همیشه جلو است.
-    - سپس priority.
-    - اگر آخرین پست از همان region بوده و منطقه دیگری با اختلاف معقول وجود دارد،
-      منطقه دیگر انتخاب می‌شود تا کانال یکنواخت نشود.
+    0-3  => 60
+    4-8  => 50
+    9-14 => 40
+    15+  => 30
+    هیچ‌وقت کمتر از 30 نمی‌شود.
     """
-    with db_connect() as conn:
-        rows = conn.execute(
-            """
-            SELECT * FROM queue
-            WHERE available_at <= ?
-            ORDER BY urgent DESC, priority DESC, important DESC, queued_at ASC
-            LIMIT 30
-            """,
-            (now_ts(),),
-        ).fetchall()
-
-    if not rows:
-        return None
-
-    last_region = kv_get("last_post_region", "")
-
-    if last_region:
-        alternatives = [dict(r) for r in rows if r["region"] != last_region]
-        if alternatives:
-            top = dict(rows[0])
-            alt = alternatives[0]
-
-            # فقط وقتی تنوع را اعمال کن که اختلاف اولویت خیلی زیاد نباشد.
-            if (
-                not top["urgent"]
-                and alt["priority"] >= top["priority"] - 25
-            ):
-                return alt
-
-    return dict(rows[0])
+    if queue_len <= 3:
+        return 60
+    if queue_len <= 8:
+        return 50
+    if queue_len <= 14:
+        return 40
+    return 30
 
 
-def delete_queue_item(item_id: int) -> None:
-    with db_connect() as conn:
-        conn.execute("DELETE FROM queue WHERE id=?", (item_id,))
+def choose_next_queue_item(state):
+    queue = state.get("_pending_queue", [])
+    if not queue:
+        return None, None
+
+    # امتیاز هر بار بر اساس وضعیت تنوع دوباره محاسبه می‌شود.
+    candidates = []
+    for index, item in enumerate(queue):
+        item = dict(item)
+        score = apply_queue_diversity_score(state, item)
+
+        # سن خبر به شکل کنترل‌شده یک tie-breaker است.
+        queued_at = item.get("queued_at", now_ts())
+        age_hours = min(24, max(0, (now_ts() - queued_at) / 3600.0))
+        score += min(12, int(age_hours))
+
+        # خبر جهانی برای تنوع جریمه مضاعف نمی‌شود.
+        candidates.append((score, index, item))
+
+    candidates.sort(key=lambda x: (x[0], x[2].get("urgent", False)), reverse=True)
+    _, index, chosen = candidates[0]
+    return index, chosen
 
 
-def compute_spacing_minutes() -> int:
-    """
-    فاصله:
-    - صف خلوت => 60 دقیقه
-    - صف شلوغ => به سمت 30 دقیقه
-    - هیچ‌وقت کمتر از 30 دقیقه
-    """
-    count = queue_count()
-    if count <= 1:
-        return STANDARD_SPACING_MINUTES
-
-    # تعداد پست‌هایی که باید در بازه هدف جا شوند.
-    target_slots = max(
-        1.0,
-        QUEUE_TARGET_HOURS * 60 / MIN_SPACING_MINUTES
-    )
-
-    # نسبت فشار صف؛ هرچه صف بزرگ‌تر باشد، spacing کمتر می‌شود.
-    pressure = min(1.0, count / target_slots)
-
-    spacing = (
-        STANDARD_SPACING_MINUTES
-        - pressure * (STANDARD_SPACING_MINUTES - MIN_SPACING_MINUTES)
-    )
-
-    return int(round(
-        max(MIN_SPACING_MINUTES, min(MAX_SPACING_MINUTES, spacing))
-    ))
+def mark_posted_region(state, item):
+    region = item.get("region", "world")
+    state["_last_posted_region"] = region
+    recent = state.setdefault("_last_posted_regions", [])
+    recent.append(region)
+    state["_last_posted_regions"] = recent[-5:]
 
 
-def process_queue() -> None:
-    if is_quiet_hour():
+def is_quiet_hour(now_dt):
+    return QUIET_START_HOUR <= now_dt.hour < QUIET_END_HOUR
+
+
+def process_queue(state):
+    queue = state.get("_pending_queue", [])
+    if not queue:
         return
 
-    item = choose_next_queue_item()
-    if not item:
+    now_dt = now_tehran()
+    if is_quiet_hour(now_dt):
         return
 
-    last_release = float(kv_get("last_queue_release_ts", "0") or "0")
-    elapsed = (time.time() - last_release) / 60
-    spacing = compute_spacing_minutes()
+    spacing = compute_dynamic_spacing_minutes(len(queue))
+    last_release = state.get("_last_queue_release_ts", 0)
 
-    # فاصله انتشار در هیچ شرایطی کمتر از MIN_SPACING_MINUTES نیست.
-    # urgent فقط ترتیب انتخاب را تغییر می‌دهد و حق دور زدن فاصله را ندارد.
-    if last_release > 0 and elapsed < spacing:
+    if last_release:
+        elapsed_minutes = (now_ts() - last_release) / 60.0
+        if elapsed_minutes < spacing:
+            return
+
+    index, item = choose_next_queue_item(state)
+    if item is None:
         return
-
-    title = item["title"]
-    if item["label"] == "night_leftover":
-        title = "🕛 خبر دیشب | " + title
-
-    final_msg = html_safe_message(title, item["body"])
 
     try:
-        dispatch_post(final_msg, item.get("photo_url"), item.get("video_url"))
+        # media URL ممکن است قدیمی شده باشد؛ عکس را قبل از پست تست می‌کنیم.
+        dispatch_item(item)
 
-        delete_queue_item(item["id"])
-        remember_posted_event(item["title"], item.get("event_key") or "")
-        kv_set("last_queue_release_ts", str(time.time()))
-        kv_set("last_post_region", item.get("region") or "other")
-
-        log.info(
-            "پست صف منتشر شد | priority=%s | region=%s | spacing=%s min | title=%s",
-            item["priority"],
-            item["region"],
-            spacing,
-            item["title"],
-        )
+    except TelegramAPIError as exc:
+        if exc.status_code == 429:
+            log.warning(
+                "Telegram rate limit در صف؛ %s ثانیه بعد دوباره تلاش می‌شود.",
+                exc.retry_after,
+            )
+            return
+        log.error("خطای Telegram در انتشار صف: %s", exc)
+        return
     except Exception as exc:
-        # حذف نمی‌کنیم؛ آیتم در صف می‌ماند تا retry شود.
-        log.error("ارسال آیتم صف ناموفق بود: %s", exc)
-
-
-# ============================================================
-# Telegram output
-# ============================================================
-
-def telegram_request(
-    method: str,
-    data: Optional[Dict[str, Any]] = None,
-    files: Optional[Dict[str, Any]] = None,
-    attempts: int = 4,
-) -> Dict[str, Any]:
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
-
-    last_exc = None
-
-    for attempt in range(attempts):
-        try:
-            if files:
-                resp = requests.post(
-                    url,
-                    data=data or {},
-                    files=files,
-                    timeout=120,
-                )
-            else:
-                resp = requests.post(
-                    url,
-                    data=data or {},
-                    timeout=30,
-                )
-
-            if resp.status_code == 429:
-                retry_after = 30
-                try:
-                    body = resp.json()
-                    retry_after = int(
-                        body.get("parameters", {}).get("retry_after", 30)
-                    )
-                except Exception:
-                    pass
-
-                wait = min(max(retry_after, 1), 300)
-                log.warning("Telegram rate limit؛ %s ثانیه صبر.", wait)
-                time.sleep(wait)
-                continue
-
-            if resp.status_code >= 500:
-                time.sleep(min(10 * (attempt + 1), 60))
-                continue
-
-            resp.raise_for_status()
-            result = resp.json()
-
-            if not result.get("ok"):
-                raise RuntimeError(str(result))
-
-            return result
-
-        except (requests.Timeout, requests.ConnectionError) as exc:
-            last_exc = exc
-            time.sleep(min(5 * (attempt + 1), 30))
-        except requests.HTTPError as exc:
-            last_exc = exc
-            break
-
-    raise RuntimeError(f"Telegram request failed: {last_exc}")
-
-
-def download_bytes(url: str, max_bytes: int, timeout: int = 60) -> bytes:
-    """
-    دانلود stream شده برای جلوگیری از مصرف بی‌دلیل RAM.
-    """
-    with requests.get(
-        url,
-        timeout=timeout,
-        headers={"User-Agent": USER_AGENT},
-        stream=True,
-        allow_redirects=True,
-    ) as resp:
-        resp.raise_for_status()
-
-        chunks = []
-        total = 0
-
-        for chunk in resp.iter_content(chunk_size=256 * 1024):
-            if not chunk:
-                continue
-            total += len(chunk)
-            if total > max_bytes:
-                raise ValueError(
-                    f"رسانه بزرگ‌تر از حد مجاز است: {total} bytes"
-                )
-            chunks.append(chunk)
-
-        return b"".join(chunks)
-
-
-def send_text_to_telegram(text: str) -> None:
-    telegram_request(
-        "sendMessage",
-        data={
-            "chat_id": TARGET_CHAT_ID,
-            "text": text,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": "false",
-        },
-    )
-
-
-def send_photo_to_telegram(caption: str, photo_url: str) -> None:
-    """
-    ابتدا upload مستقیم.
-    اگر عکس در دسترس نبود، پست را بدون عکس نمی‌فرستیم؛ caller fallback می‌کند.
-    """
-    photo_bytes = download_bytes(photo_url, MAX_PHOTO_BYTES, timeout=60)
-
-    telegram_request(
-        "sendPhoto",
-        data={
-            "chat_id": TARGET_CHAT_ID,
-            "caption": caption,
-            "parse_mode": "HTML",
-        },
-        files={
-            "photo": ("photo.jpg", photo_bytes),
-        },
-    )
-
-
-def send_video_to_telegram(caption: str, video_url: str) -> None:
-    video_bytes = download_bytes(video_url, MAX_VIDEO_BYTES, timeout=120)
-
-    telegram_request(
-        "sendVideo",
-        data={
-            "chat_id": TARGET_CHAT_ID,
-            "caption": caption,
-            "parse_mode": "HTML",
-            "supports_streaming": "true",
-        },
-        files={
-            "video": ("video.mp4", video_bytes),
-        },
-    )
-
-
-def dispatch_post(final_msg: str, photo_url: Optional[str], video_url: Optional[str]) -> None:
-    """
-    نکته مهم:
-    Caption تلگرام محدود است. اگر متن بیش از 1024 کاراکتر باشد،
-    رسانه را جداگانه می‌فرستیم و متن را جداگانه تا خبر ناقص نشود.
-    """
-    if video_url:
-        if len(final_msg) <= 1024:
-            try:
-                send_video_to_telegram(final_msg, video_url)
-                return
-            except Exception as exc:
-                log.warning("ارسال ویدئو با caption شکست خورد: %s", exc)
-        else:
-            try:
-                send_video_to_telegram("", video_url)
-                send_text_to_telegram(final_msg)
-                return
-            except Exception as exc:
-                log.warning("ارسال ویدئو شکست خورد: %s", exc)
-
-    if photo_url:
-        if len(final_msg) <= 1024:
-            try:
-                send_photo_to_telegram(final_msg, photo_url)
-                return
-            except Exception as exc:
-                log.warning("ارسال عکس شکست خورد؛ fallback به متن: %s", exc)
-        else:
-            try:
-                send_photo_to_telegram("", photo_url)
-                send_text_to_telegram(final_msg)
-                return
-            except Exception as exc:
-                log.warning("ارسال عکس جداگانه شکست خورد: %s", exc)
-
-    # در نبود/خرابی رسانه، خبر هرگز از دست نمی‌رود.
-    send_text_to_telegram(final_msg)
-
-
-# ============================================================
-# پردازش منابع
-# ============================================================
-
-def source_batch_ready(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    برای تجمیع پست‌های پشت‌سرهم یک منبع:
-    - آیتم‌ها را به دسته‌های کوچک تقسیم می‌کنیم.
-    - Gemini خودش تشخیص می‌دهد کدام‌ها یک رویدادند.
-    """
-    items = sorted(
-        items,
-        key=lambda x: x.get("published_at") or x.get("discovered_at") or ""
-    )
-
-    batches = []
-    current = []
-
-    for item in items:
-        if len(current) >= MAX_GROUP_POSTS:
-            batches.append(current)
-            current = []
-
-        if current:
-            # اگر timestamp قابل تبدیل باشد، فاصله را بررسی می‌کنیم.
-            # در صورت نبود زمان، فقط سقف تعداد را ملاک می‌گیریم.
-            prev = current[-1].get("published_at")
-            cur = item.get("published_at")
-
-            if prev and cur:
-                try:
-                    p = datetime.fromisoformat(prev.replace("Z", "+00:00"))
-                    c = datetime.fromisoformat(cur.replace("Z", "+00:00"))
-                    if abs((c - p).total_seconds()) > GROUP_WINDOW_MINUTES * 60:
-                        batches.append(current)
-                        current = []
-                except Exception:
-                    pass
-
-        current.append(item)
-
-    if current:
-        batches.append(current)
-
-    return batches
-
-
-def process_new_items() -> None:
-    items = get_new_source_items(limit=100)
-    if not items:
+        # آیتم از صف حذف نمی‌شود؛ بنابراین با یک خطای موقت خبر گم نمی‌شود.
+        log.error("خطا در انتشار آیتم صف؛ آیتم نگه داشته شد: %s", exc)
         return
 
-    # ابتدا بر اساس source جدا می‌کنیم؛ پست‌های پشت‌سرهم هر منبع کنار هم قرار می‌گیرند.
-    by_source: Dict[str, List[Dict[str, Any]]] = {}
-    for item in items:
-        by_source.setdefault(item["source_key"], []).append(item)
+    # فقط بعد از انتشار موفق حذف شود.
+    queue.pop(index)
+    state["_pending_queue"] = queue
+    state["_last_queue_release_ts"] = now_ts()
+    mark_posted_region(state, item)
+    save_state(state)
 
-    for source_key, source_items in by_source.items():
-        for batch in source_batch_ready(source_items):
-            uids = [x["uid"] for x in batch]
-
-            try:
-                groups = analyze_batch(batch)
-                known_uids = set(uids)
-
-                validated = []
-                for group in groups:
-                    v = validate_group(group, known_uids)
-                    if v:
-                        validated.append(v)
-
-                validated = merge_same_event_groups(validated)
-
-                # اگر Gemini چیزی برنگرداند، خبرها را failed نمی‌کنیم؛
-                # دوباره در اجرای بعدی retry می‌شوند.
-                if not validated:
-                    raise ValueError("Gemini هیچ گروه خبری معتبر برنگرداند.")
-
-                assigned = set()
-
-                for group in validated:
-                    if enqueue_group(group, label="news"):
-                        assigned.update(group["source_uids"])
-
-                # UIDهایی که Gemini صراحتاً به گروهی نسبت نداده، به عنوان processed
-                # ثبت نمی‌شوند؛ تا خبر از بین نرود و در اجرای بعدی دوباره بررسی شود.
-                for uid in assigned:
-                    mark_source_status(uid, "processed")
-
-                unassigned = set(uids) - assigned
-
-                # اگر Gemini گروهی را relevant=false تشخیص داده باشد، در خروجی source_uids
-                # ندارد؛ برای جلوگیری از پردازش بی‌نهایت، باید این موارد نیز به شکل ردشده ثبت شوند.
-                # اما فقط وقتی مطمئنیم پاسخ Gemini معتبر بوده.
-                for uid in unassigned:
-                    mark_source_status(uid, "rejected")
-
-                log.info(
-                    "منبع %s: %s آیتم → %s گروه خبری",
-                    source_key,
-                    len(batch),
-                    len(validated),
-                )
-
-            except Exception as exc:
-                log.error(
-                    "پردازش batch منبع %s شکست خورد؛ آیتم‌ها برای retry باقی می‌مانند: %s",
-                    source_key,
-                    exc,
-                )
-                # عمداً status را تغییر نمی‌دهیم.
+    log.info(
+        "پست منتشر شد | region=%s | score=%s | queue=%s | spacing=%s دقیقه",
+        item.get("region"),
+        item.get("priority_score"),
+        len(queue),
+        spacing,
+    )
 
 
 # ============================================================
-# Scheduled messages
+# Source grouping / processing
 # ============================================================
 
-def check_scheduled_messages() -> None:
-    now = tehran_now()
-    today = now.strftime("%Y-%m-%d")
+def combine_original_media(cluster):
+    photo = next((p.get("photo") for p in cluster if p.get("photo")), None)
+    video = next((p.get("video") for p in cluster if p.get("video")), None)
+    source_url = next((p.get("source_url") for p in cluster if p.get("source_url")), "")
+    source_urls = [
+        p.get("source_url")
+        for p in cluster
+        if p.get("source_url")
+    ]
+    return photo, video, source_url, source_urls
 
-    if now.hour == MORNING_HOUR and kv_get("last_morning_date") != today:
+
+def build_batch_text(cluster):
+    chunks = []
+    for idx, post in enumerate(cluster, start=1):
+        chunks.append(
+            f"--- پست ورودی {idx} ---\n"
+            f"عنوان: {post.get('title','')}\n"
+            f"زمان: {post.get('published_at','')}\n"
+            f"لینک: {post.get('source_url','')}\n"
+            f"متن:\n{post.get('text','')}"
+        )
+    return "\n\n".join(chunks)
+
+
+def process_cluster(state, source_key, cluster):
+    if not cluster:
+        return
+
+    source_name = cluster[0].get("source_name", source_key)
+
+    # Gemini فقط با batchهای مرتبط کار می‌کند؛ حتی اگر یک پست باشد.
+    items = analyze_and_rewrite_safe(
+        state,
+        cluster,
+        source_name,
+    )
+
+    if not items:
+        raise ValueError("Gemini هیچ آیتم قابل انتشار برنگرداند.")
+
+    photo_url, video_url, first_source_url, source_urls = combine_original_media(cluster)
+
+    successful_interpretation = False
+
+    for result in items:
+        if not result.get("relevant"):
+            successful_interpretation = True
+            continue
+
+        title = normalize_space(result.get("title", ""))
+        body = (result.get("body", "") or "").strip()
+
+        if not title or not body:
+            continue
+
+        if is_duplicate(state, title, body):
+            log.info("یک خروجی به‌عنوان رویداد تکراری رد شد: %s", title)
+            successful_interpretation = True
+            continue
+
+        region = infer_region(
+            f"{title}\n{body}",
+            result.get("region"),
+        )
+
+        item = {
+            "title": title,
+            "body": body,
+            "image_query": result.get("image_query", ""),
+            "urgent": safe_bool(result.get("urgent")),
+            "important": safe_bool(result.get("important")),
+            "region": region,
+            "event_type": result.get("event_type", "routine"),
+            "priority_hint": safe_int(result.get("priority_hint"), 0),
+            "source_note": result.get("source_note", ""),
+            "source_url": first_source_url,
+            "source_urls": source_urls[:10],
+            "photo": photo_url,
+            "video": video_url,
+            "queued_at": now_ts(),
+        }
+
+        # اگر عکس منبع وجود ندارد، fallback واقعی انجام می‌شود.
+        if not item["photo"] and not item["video"]:
+            item["photo"] = choose_image_url(
+                item,
+                cluster,
+            )
+
+        apply_queue_diversity_score(state, item)
+        enqueue_item(state, item)
+        remember_item(state, item)
+
+        successful_interpretation = True
+
+        # اگر یک cluster چند خروجی دارد، برای خروجی دوم رسانه اولیه را فقط در صورت
+        # نبود تصویر بهتر استفاده می‌کنیم. از چندبار ارسال ویدیو جلوگیری می‌شود.
+        photo_url = None
+        video_url = None
+
+    if not successful_interpretation:
+        raise ValueError("هیچ خروجی معتبری از cluster تولید نشد.")
+
+
+def process_source(state, source_key, posts):
+    """
+    نکته مهم:
+    UID فقط بعد از اینکه Gemini موفق شد و نتیجه با موفقیت در صف ثبت شد mark می‌شود.
+    بنابراین Timeout/429/خطای شبکه باعث گم‌شدن دائمی خبر نمی‌شود.
+    """
+    if not posts:
+        return
+
+    processed = set(state.get(source_key, []))
+
+    # بار اول فقط snapshot می‌گیریم و هیچ خبر قدیمی را پردازش نمی‌کنیم.
+    if not state.get("_source_initialized", {}).get(source_key):
+        state.setdefault("_source_initialized", {})[source_key] = True
+        state[source_key] = [p["uid"] for p in posts[-500:]]
+        save_state(state)
+        log.info(
+            "منبع %s برای اولین بار ثبت شد؛ پست‌های موجود قدیمی پردازش نشدند.",
+            source_key,
+        )
+        return
+
+    new_posts = [
+        p for p in posts
+        if p.get("uid") not in processed
+    ]
+
+    if not new_posts:
+        return
+
+    clusters = cluster_posts(new_posts)
+
+    for cluster in clusters:
+        uids = [p["uid"] for p in cluster]
         try:
-            send_text_to_telegram(html_safe_message("", MORNING_MESSAGE))
-            kv_set("last_morning_date", today)
+            process_cluster(
+                state,
+                source_key,
+                cluster,
+            )
+
+            # فقط بعد از موفقیت کامل.
+            current = state.setdefault(source_key, [])
+            for uid in uids:
+                if uid not in current:
+                    current.append(uid)
+            state[source_key] = current[-500:]
+            save_state(state)
+
+            log.info(
+                "cluster با %s پست پردازش و به صف افزوده شد؛ source=%s",
+                len(cluster),
+                source_key,
+            )
+
+        except Exception as exc:
+            log.error(
+                "cluster شکست خورد و UIDهای آن mark نشدند؛ source=%s error=%s",
+                source_key,
+                exc,
+            )
+            # هیچ UID از این cluster مصرف‌شده تلقی نمی‌شود.
+            continue
+
+
+# ============================================================
+# Scheduled messages / cleanup
+# ============================================================
+
+def purge_unimportant_queue(state, today_str):
+    if state.get("_last_queue_purge_date") == today_str:
+        return
+
+    queue = state.get("_pending_queue", [])
+    before = len(queue)
+
+    # خبرهای مهم و urgent باقی می‌مانند؛ باقی‌مانده‌های معمولی شب حذف می‌شوند.
+    state["_pending_queue"] = [
+        item for item in queue
+        if safe_bool(item.get("important")) or safe_bool(item.get("urgent"))
+    ]
+    state["_last_queue_purge_date"] = today_str
+
+    removed = before - len(state["_pending_queue"])
+    if removed:
+        log.info(
+            "%s خبر عادیِ باقی‌مانده در نیمه‌شب حذف شد.",
+            removed,
+        )
+
+    save_state(state)
+
+
+def check_scheduled_messages(state):
+    now = now_tehran()
+    today_str = now.strftime("%Y-%m-%d")
+
+    if now.hour == MORNING_HOUR and state.get("_last_morning_date") != today_str:
+        try:
+            send_text_to_telegram(MORNING_MESSAGE)
+            state["_last_morning_date"] = today_str
+            save_state(state)
             log.info("پیام صبح‌بخیر ارسال شد.")
         except Exception as exc:
-            log.error("پیام صبح‌بخیر ارسال نشد: %s", exc)
+            log.error("ارسال صبح‌بخیر شکست خورد: %s", exc)
 
-    if now.hour == NIGHT_HOUR and kv_get("last_night_date") != today:
+    if now.hour == NIGHT_HOUR and state.get("_last_night_date") != today_str:
         try:
-            send_text_to_telegram(html_safe_message("", NIGHT_MESSAGE))
-            kv_set("last_night_date", today)
+            send_text_to_telegram(NIGHT_MESSAGE)
+            state["_last_night_date"] = today_str
+            save_state(state)
             log.info("پیام شب‌بخیر ارسال شد.")
         except Exception as exc:
-            log.error("پیام شب‌بخیر ارسال نشد: %s", exc)
+            log.error("ارسال شب‌بخیر شکست خورد: %s", exc)
+
+        purge_unimportant_queue(state, today_str)
 
 
 # ============================================================
-# Fetch cycle
+# Polling
 # ============================================================
 
-def collect_sources() -> None:
+def process_once(state):
+    all_sources = []
+
     for channel in SOURCE_CHANNELS:
-        try:
-            posts = fetch_channel_posts(channel)
-            for post in posts:
-                if not source_exists(post["uid"]):
-                    save_source_item(post)
-        except Exception as exc:
-            log.error("خطا در منبع تلگرام %s: %s", channel, exc)
+        posts = fetch_channel_posts(channel)
+        if posts:
+            all_sources.append(
+                (f"tg:{channel}", posts)
+            )
 
     for feed_url in SOURCE_WEBSITES:
-        try:
-            posts = fetch_website_posts(feed_url)
-            for post in posts:
-                if not source_exists(post["uid"]):
-                    save_source_item(post)
-        except Exception as exc:
-            log.error("خطا در RSS %s: %s", feed_url, exc)
+        posts = fetch_website_posts(feed_url)
+        if posts:
+            all_sources.append(
+                (f"web:{feed_url}", posts)
+            )
+
+    # هر منبع ابتدا جداگانه گروه‌بندی می‌شود تا زنجیره پست‌های همان منبع
+    # بهتر جمع‌بندی شود.
+    for source_key, posts in all_sources:
+        process_source(
+            state,
+            source_key,
+            posts,
+        )
+
+    check_scheduled_messages(state)
+    process_queue(state)
+    purge_recent_memories(state)
+    save_state(state)
+
+
+# ============================================================
+# Configuration validation
+# ============================================================
+
+def validate_config():
+    missing = []
+
+    if not BOT_TOKEN:
+        missing.append("BOT_TOKEN")
+
+    if not TARGET_CHAT_ID:
+        missing.append("TARGET_CHAT_ID")
+
+    if not GEMINI_API_KEYS:
+        missing.append("GEMINI_API_KEYS یا GEMINI_API_KEY")
+
+    if not SOURCE_CHANNELS and not SOURCE_WEBSITES:
+        missing.append("SOURCE_CHANNELS یا SOURCE_WEBSITES")
+
+    if missing:
+        raise RuntimeError(
+            "این متغیرهای ضروری تنظیم نشده‌اند: " + ", ".join(missing)
+        )
+
+    if len(GEMINI_API_KEYS) < 2:
+        log.warning(
+            "فقط %s کلید Gemini تنظیم شده است؛ چرخش چندکلیدی فعال می‌ماند اما "
+            "مزیت failover محدود است.",
+            len(GEMINI_API_KEYS),
+        )
+
+    # کلیدهای تکراری.
+    duplicates = len(GEMINI_API_KEYS) - len({key_id(k) for k in GEMINI_API_KEYS})
+    if duplicates:
+        raise RuntimeError(
+            f"{duplicates} کلید Gemini تکراری است؛ کلیدها را بررسی کن."
+        )
 
 
 # ============================================================
 # Main
 # ============================================================
 
-def validate_config() -> List[str]:
-    missing = []
+def main():
+    validate_config()
 
-    if not BOT_TOKEN:
-        missing.append("BOT_TOKEN")
-    if not TARGET_CHAT_ID:
-        missing.append("TARGET_CHAT_ID")
-    if not GEMINI_API_KEYS:
-        missing.append("GEMINI_API_KEYS")
-    if not SOURCE_CHANNELS and not SOURCE_WEBSITES:
-        missing.append("SOURCE_CHANNELS یا SOURCE_WEBSITES")
-
-    return missing
-
-
-def main() -> None:
-    init_db()
-
-    missing = validate_config()
-    if missing:
-        log.error("متغیرهای لازم تنظیم نشده‌اند: %s", ", ".join(missing))
-        return
+    state = load_state()
+    cleanup_gemini_key_state(state)
+    save_state(state)
 
     log.info("==============================================")
-    log.info("Military News Bot V2 started")
+    log.info("Raptor News Bot v2 شروع شد")
     log.info("Telegram sources: %s", len(SOURCE_CHANNELS))
     log.info("RSS sources: %s", len(SOURCE_WEBSITES))
-    log.info("Gemini keys configured: %s", len(GEMINI_API_KEYS))
-    log.info(
-        "Posting spacing: standard=%s min=%s max=%s",
-        STANDARD_SPACING_MINUTES,
-        MIN_SPACING_MINUTES,
-        MAX_SPACING_MINUTES,
-    )
-    log.info(
-        "Event grouping: window=%s min max_posts=%s",
-        GROUP_WINDOW_MINUTES,
-        MAX_GROUP_POSTS,
-    )
-    log.info("Persistent DB: %s", DB_FILE)
+    log.info("Gemini keys: %s", len(GEMINI_API_KEYS))
+    log.info("Gemini model: %s", GEMINI_MODEL)
+    log.info("Queue spacing: 60 -> 30 minutes")
+    log.info("Event cluster max inputs: %s", EVENT_MAX_ITEMS_PER_CLUSTER)
+    log.info("Event cluster max outputs: %s", EVENT_MAX_OUTPUT_ITEMS)
+    log.info("State file: %s", STATE_FILE)
     log.info("==============================================")
 
     while True:
-        cycle_started = time.time()
+        started = now_ts()
 
         try:
-            collect_sources()
+            process_once(state)
         except Exception as exc:
-            log.error("خطای collect_sources: %s", exc)
+            log.exception("خطای عمومی در چرخه اصلی: %s", exc)
 
-        try:
-            process_new_items()
-        except Exception as exc:
-            log.error("خطای process_new_items: %s", exc)
-
-        try:
-            check_scheduled_messages()
-        except Exception as exc:
-            log.error("خطای scheduled messages: %s", exc)
-
-        try:
-            process_queue()
-        except Exception as exc:
-            log.error("خطای process_queue: %s", exc)
-
-        elapsed = time.time() - cycle_started
+        elapsed = now_ts() - started
         sleep_for = max(5, POLL_INTERVAL_SECONDS - int(elapsed))
-        log.info(
-            "چرخه تمام شد؛ صف=%s؛ اجرای بعدی حدود %s ثانیه دیگر.",
-            queue_count(),
-            sleep_for,
-        )
         time.sleep(sleep_for)
 
 
