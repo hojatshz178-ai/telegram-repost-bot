@@ -13,7 +13,7 @@
 - تنوع جغرافیایی در صف تا کانال به یک منطقه محدود نشود
 - فاصله استاندارد انتشار 60 دقیقه
 - در صف شلوغ، فاصله به‌صورت پویا کم می‌شود ولی هرگز کمتر از 30 دقیقه نیست
-- urgent واقعی: بلافاصله منتشر می‌شود، حتی در سکوت شبانه
+- urgent فقط اولویت صف را بالا می‌برد؛ فاصله حداقل 30 دقیقه در همه شرایط حفظ می‌شود
 - مهم: خبرهای مهم زودتر از عادی منتشر می‌شوند ولی کانال را بمباران نمی‌کنند
 - ذخیره پایدار وضعیت در SQLite
 - retry هوشمند برای Telegram و Gemini
@@ -92,9 +92,24 @@ GEMINI_API_URL = (
 POLL_INTERVAL_SECONDS = max(30, env_int("POLL_INTERVAL_SECONDS", 300))
 
 # انتشار:
-STANDARD_SPACING_MINUTES = max(30, env_int("STANDARD_POST_SPACING_MINUTES", 60))
-MIN_SPACING_MINUTES = max(30, env_int("MIN_POST_SPACING_MINUTES", 30))
-MAX_SPACING_MINUTES = max(STANDARD_SPACING_MINUTES, env_int("MAX_POST_SPACING_MINUTES", 60))
+STANDARD_SPACING_MINUTES = max(
+    30,
+    env_int(
+        "STANDARD_POST_SPACING_MINUTES",
+        env_int("NORMAL_POST_INTERVAL_MINUTES", 60),
+    ),
+)
+MIN_SPACING_MINUTES = max(
+    30,
+    env_int(
+        "MIN_POST_SPACING_MINUTES",
+        env_int("MIN_POST_INTERVAL_MINUTES", 30),
+    ),
+)
+MAX_SPACING_MINUTES = max(
+    STANDARD_SPACING_MINUTES,
+    env_int("MAX_POST_SPACING_MINUTES", STANDARD_SPACING_MINUTES),
+)
 
 # اگر صف بسیار شلوغ باشد، فاصله به سمت 30 دقیقه می‌رود، ولی از 30 کمتر نمی‌شود.
 QUEUE_TARGET_HOURS = max(1.0, env_float("QUEUE_TARGET_HOURS", 12.0))
@@ -125,13 +140,11 @@ FOOTER = "#raptor\n————————\n@khaatshekaan"
 
 MORNING_MESSAGE = (
     "🌅 صبح بخیر به همراهان کانال\n"
-    "روزتون پر از آرامش و اخبار دقیق باشه 🫡\n\n"
-    + FOOTER
+    "روزتون پر از آرامش و اخبار دقیق باشه 🫡"
 )
 NIGHT_MESSAGE = (
     "🌙 شب بخیر رپتوری‌های عزیز\n"
-    "فردا با اخبار تازه در خدمتتون هستیم 🛡️\n\n"
-    + FOOTER
+    "فردا با اخبار تازه در خدمتتون هستیم 🛡️"
 )
 
 DB_FILE = os.environ.get("STATE_DB_FILE", "/data/state.db")
@@ -834,7 +847,9 @@ def analyze_batch(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     if not items:
         return []
 
-    prompt = BATCH_PROMPT.format(items_json=build_batch_input(items))
+    # از str.format استفاده نمی‌کنیم چون خود prompt شامل JSON و آکولاد است.
+    # فقط placeholder مشخص را جایگزین می‌کنیم تا خطای KeyError مثل 'groups' ایجاد نشود.
+    prompt = BATCH_PROMPT.replace("{items_json}", build_batch_input(items))
     result = gemini_request(prompt)
     groups = result.get("groups", [])
 
@@ -1177,8 +1192,9 @@ def process_queue() -> None:
     elapsed = (time.time() - last_release) / 60
     spacing = compute_spacing_minutes()
 
-    # اگر این آیتم urgent نیست، فاصله استاندارد/پویا رعایت شود.
-    if not item["urgent"] and last_release > 0 and elapsed < spacing:
+    # فاصله انتشار در هیچ شرایطی کمتر از MIN_SPACING_MINUTES نیست.
+    # urgent فقط ترتیب انتخاب را تغییر می‌دهد و حق دور زدن فاصله را ندارد.
+    if last_release > 0 and elapsed < spacing:
         return
 
     title = item["title"]
