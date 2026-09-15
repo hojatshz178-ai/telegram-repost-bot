@@ -288,9 +288,9 @@ region یکی از این چهار مقدار دقیق باشد:
 15) خروجی فقط JSON معتبر باشد، بدون Markdown و بدون توضیح اضافی.
 
 فرمت:
-{
+{{
   "items": [
-    {
+    {{
       "relevant": true,
       "urgent": false,
       "important": false,
@@ -301,9 +301,9 @@ region یکی از این چهار مقدار دقیق باشد:
       "event_type": "military_event|security|defense|geopolitics|routine",
       "priority_hint": 0,
       "source_note": "..."
-    }
+    }}
   ]
-}
+}}
 
 متن/پست‌های ورودی:
 ---
