@@ -37,7 +37,10 @@ POLL_INTERVAL_SECONDS = int(os.environ.get("POLL_INTERVAL_SECONDS", "300"))
 DEDUP_WINDOW_MINUTES = int(os.environ.get("DEDUP_WINDOW_MINUTES", "240"))
 DEDUP_SIMILARITY_THRESHOLD = float(os.environ.get("DEDUP_SIMILARITY_THRESHOLD", "0.6"))
 # فاصله‌ی زمانی پخش پست‌های سایت/باقی‌مانده‌ی شب در طول روز (دقیقه)
-SITE_POST_SPACING_MINUTES = int(os.environ.get("SITE_POST_SPACING_MINUTES", "90"))
+# این یک بازه‌ی متغیر است: وقتی صف خلوت است به سقف (MAX) نزدیک می‌شود،
+# وقتی صف شلوغ می‌شود به‌صورت خودکار تا کف (MIN) کاهش می‌یابد تا همه در طول روز جا شوند.
+MAX_QUEUE_SPACING_MINUTES = int(os.environ.get("SITE_POST_SPACING_MINUTES", "60"))
+MIN_QUEUE_SPACING_MINUTES = int(os.environ.get("SITE_POST_MIN_SPACING_MINUTES", "20"))
 STATE_FILE = "/data/state.json" if os.path.isdir("/data") else "state.json"
 
 GEMINI_MODEL = "gemini-flash-latest"
@@ -95,7 +98,9 @@ REWRITE_PROMPT = """تو یک خبرنگار حرفه‌ای حوزه‌ی نظ�
 
 ۱۴. اگر محتوا مربوط به یک منبع خاص (سایت خبری) است و صرفاً یک مقاله‌ی خبری/تحلیلی است (نه چند خبر جدا)، به‌جای پست طولانی، فقط یک چکیده‌ی کوتاه و آماده‌ی انتشار از آن بساز که اطلاعات کلی و مهم را داشته باشد.
 
-۱۵. تشخیص فوریت: مقدار "urgent" را فقط و فقط برای خبرهای واقعاً فوری و لحظه‌ای علامت true بزن — مثل شروع ناگهانی جنگ یا درگیری، حمله‌ی نظامی مستقیم، تشدید حاد بحران، یا زمانی که خود منبع آن را با عناوینی مثل «فوری»، «breaking»، «عاجل» اعلام کرده باشد. برای اخبار عادی، تحلیلی، یا غیرفوری این مقدار را false بگذار.
+۱۵. تشخیص فوریت: مقدار "urgent" را فقط و فقط برای خبرهای واقعاً فوری و لحظه‌ای علامت true بزن — مثل شروع ناگهانی جنگ یا درگیری، حمله‌ی نظامی مستقیم، تشدید حاد بحران، یا زمانی که خود منبع آن را با عناوینی مثل «فوری»، «breaking»، «عاجل» اعلام کرده باشد. خبر urgent در هر لحظه (حتی در ساعت سکوت شبانه‌ی کانال) بلافاصله منتشر می‌شود. برای اخبار عادی، تحلیلی، یا غیرفوری این مقدار را false بگذار.
+
+۱۶. تشخیص اهمیت نسبی: مقدار "important" را true بزن اگر این خبر نسبت به اخبار معمول کانال، اهمیت راهبردی/عملیاتی بالاتری دارد و باید زودتر از بقیه‌ی اخبار در صف انتشار منتشر شود (مثلاً تحولات بزرگ میدانی، تغییرات مهم در توازن قوا، اخبار تأثیرگذار بر یک منطقه یا درگیری مهم) — even اگر urgent=false باشد. برای اخبار عادی و روزمره این مقدار را false بگذار. این فیلد جدا از "urgent" است: "urgent" یعنی همین الان و حتی در سکوت شبانه منتشر شود، "important" یعنی نسبت به بقیه‌ی صف انتظار، اولویت زودتر منتشرشدن دارد و اگر تا نیمه‌شب در صف بماند حذف نمی‌شود.
 
 خروجی را دقیقاً و فقط به‌شکل یک آبجکت JSON معتبر برگردان (بدون Markdown، بدون بک‌تیک، بدون هیچ توضیح اضافه قبل یا بعد از آن)، با این فرمت:
 {{
@@ -103,6 +108,7 @@ REWRITE_PROMPT = """تو یک خبرنگار حرفه‌ای حوزه‌ی نظ�
     {{
       "relevant": true یا false,
       "urgent": true یا false,
+      "important": true یا false,
       "title": "تیتر کوتاه فارسی (اگر relevant=false رشته خالی)",
       "body": "متن کامل بازنویسی‌شده شامل پاراگراف‌ها، بدون تکرار تیتر در ابتدای متن (اگر relevant=false رشته خالی)",
       "image_query": "۳ تا ۵ کلمه‌ی انگلیسی کوتاه برای جستجوی یک عکس استوک مرتبط با موضوع این خبر (اگر relevant=false رشته خالی)"
@@ -412,16 +418,32 @@ def remember_title(state, title):
 
 
 # ---------- صف پخش‌شونده در طول روز (برای پست‌های سایت و باقی‌مانده‌ی شب) ----------
-def enqueue_post(state, title, body, photo_url, video_url, label):
+def enqueue_post(state, title, body, photo_url, video_url, label, important=False):
+    """
+    پست را وارد صف انتظار می‌کند.
+    اگر important=True باشد، جلوتر از همه‌ی آیتم‌های عادی (ولی بعد از آیتم‌های مهمِ قبلی) قرار می‌گیرد
+    تا زودتر منتشر شود.
+    """
     queue = state.get("_pending_queue", [])
-    queue.append({
+    item = {
         "title": title,
         "body": body,
         "photo": photo_url,
         "video": video_url,
         "label": label,  # "site" یا "night_leftover"
+        "important": important,
         "queued_at": time.time(),
-    })
+    }
+    if important:
+        insert_at = 0
+        for i, existing in enumerate(queue):
+            if existing.get("important"):
+                insert_at = i + 1
+            else:
+                break
+        queue.insert(insert_at, item)
+    else:
+        queue.append(item)
     state["_pending_queue"] = queue[-300:]
     save_state(state)
 
@@ -432,8 +454,22 @@ def is_quiet_hour(now_dt):
     return QUIET_START_HOUR <= now_dt.hour < QUIET_END_HOUR
 
 
+def compute_dynamic_spacing(now_dt, queue_len):
+    """
+    بازه‌ی زمانی بین دو انتشار متوالی از صف را به‌صورت پویا بین
+    MIN_QUEUE_SPACING_MINUTES و MAX_QUEUE_SPACING_MINUTES محاسبه می‌کند:
+    هرچه صف شلوغ‌تر یا زمان باقی‌مانده تا نیمه‌شب کمتر باشد، فاصله کوتاه‌تر می‌شود.
+    """
+    if queue_len <= 0:
+        return MAX_QUEUE_SPACING_MINUTES
+    minutes_since_midnight = now_dt.hour * 60 + now_dt.minute
+    remaining_minutes_to_midnight = max((24 * 60) - minutes_since_midnight, 1)
+    ideal_spacing = remaining_minutes_to_midnight / queue_len
+    return max(MIN_QUEUE_SPACING_MINUTES, min(MAX_QUEUE_SPACING_MINUTES, ideal_spacing))
+
+
 def process_queue(state):
-    """در ساعات روز (۸ صبح تا ۱۲ شب)، پست‌های صف‌شده را با فاصله‌ی زمانی منتشر می‌کند."""
+    """در ساعات روز (۸ صبح تا ۱۲ شب)، پست‌های صف‌شده را با فاصله‌ی زمانی متغیر منتشر می‌کند."""
     if not TEHRAN_TZ:
         return
     now_dt = datetime.now(TEHRAN_TZ)
@@ -444,12 +480,13 @@ def process_queue(state):
     if not queue:
         return
 
+    spacing_minutes = compute_dynamic_spacing(now_dt, len(queue))
     last_release = state.get("_last_queue_release_ts", 0)
     elapsed_minutes = (time.time() - last_release) / 60
-    if elapsed_minutes < SITE_POST_SPACING_MINUTES:
+    if elapsed_minutes < spacing_minutes:
         return
 
-    item = queue.pop(0)
+    item = queue.pop(0)  # چون آیتم‌های مهم جلوتر از بقیه درج شده‌اند، همیشه اولویت‌دار زودتر می‌آید
     state["_pending_queue"] = queue
 
     title = item.get("title", "")
@@ -460,12 +497,30 @@ def process_queue(state):
     final_msg = build_final_message(title, body)
     try:
         dispatch_post(final_msg, item.get("photo"), item.get("video"))
-        log.info(f"یک پست از صف پخش روزانه ({item.get('label')}) منتشر شد.")
+        log.info(
+            f"یک پست از صف پخش روزانه ({item.get('label')}, مهم={item.get('important')}) منتشر شد. "
+            f"فاصله‌ی محاسبه‌شده تا پست بعدی: {round(spacing_minutes)} دقیقه."
+        )
     except Exception as e:
         log.error(f"خطا در انتشار پست از صف: {e}")
 
     state["_last_queue_release_ts"] = time.time()
     save_state(state)
+
+
+def purge_unimportant_queue(state, today_str):
+    """در نیمه‌شب، خبرهای کم‌اهمیتی که هنوز در صف مانده‌اند حذف می‌شوند و به روز بعد منتقل نمی‌شوند."""
+    if state.get("_last_queue_purge_date") == today_str:
+        return
+    queue = state.get("_pending_queue", [])
+    before_count = len(queue)
+    remaining = [item for item in queue if item.get("important")]
+    removed_count = before_count - len(remaining)
+    state["_pending_queue"] = remaining
+    state["_last_queue_purge_date"] = today_str
+    save_state(state)
+    if removed_count:
+        log.info(f"در نیمه‌شب {removed_count} خبر کم‌اهمیت باقی‌مانده در صف حذف شد (به روز بعد منتقل نمی‌شود).")
 
 
 # ---------- پردازش یک منبع ----------
@@ -501,6 +556,7 @@ def process_posts(state, source_key, posts):
                 body = (result.get("body") or "").strip()
                 image_query = (result.get("image_query") or "").strip()
                 urgent = bool(result.get("urgent"))
+                important = bool(result.get("important"))
 
                 if is_duplicate(state, title):
                     log.info(f"یک آیتم از {uid} به‌عنوان پست تکراری (رویداد مشابه اخیر) رد شد.")
@@ -515,14 +571,14 @@ def process_posts(state, source_key, posts):
 
                 if is_website_source:
                     # طبق دستور: خبرهای سایت همیشه در صف پخش روزانه قرار می‌گیرند، هرگز فوری منتشر نمی‌شوند
-                    enqueue_post(state, title, body, photo_url, video_url, label="site")
+                    enqueue_post(state, title, body, photo_url, video_url, label="site", important=important)
                     remember_title(state, title)
-                    log.info(f"یک آیتم از {uid} به صف پخش روزانه اضافه شد.")
+                    log.info(f"یک آیتم از {uid} به صف پخش روزانه اضافه شد (مهم={important}).")
                 elif is_quiet_hour(now_dt) and not urgent:
                     # ساعت سکوت شبانه و خبر فوری نیست → برای فردا صبح ذخیره می‌شود
-                    enqueue_post(state, title, body, photo_url, video_url, label="night_leftover")
+                    enqueue_post(state, title, body, photo_url, video_url, label="night_leftover", important=important)
                     remember_title(state, title)
-                    log.info(f"یک آیتم از {uid} به دلیل ساعت سکوت شبانه به صف اضافه شد.")
+                    log.info(f"یک آیتم از {uid} به دلیل ساعت سکوت شبانه به صف اضافه شد (مهم={important}).")
                 else:
                     # کانال تلگرام، خارج از سکوت شبانه یا خبر فوری → همین الان منتشر شود
                     final_msg = build_final_message(title, body)
@@ -566,6 +622,8 @@ def check_scheduled_messages(state):
             log.info("پیام شب‌بخیر ارسال شد.")
         except Exception as e:
             log.error(f"خطا در ارسال پیام شب‌بخیر: {e}")
+        # هم‌زمان با پیام شب‌بخیر، صف را از خبرهای کم‌اهمیتِ باقی‌مانده پاک‌سازی می‌کنیم
+        purge_unimportant_queue(state, today_str)
 
 
 # ---------- حلقه‌ی اصلی ----------
@@ -599,7 +657,8 @@ def main():
     state = load_state()
     log.info(
         f"ربات شروع به کار کرد. کانال‌ها: {SOURCE_CHANNELS} | سایت‌ها: {len(SOURCE_WEBSITES)} فید | "
-        f"تعداد کلید Gemini: {len(GEMINI_API_KEYS)} | فاصله‌ی پخش روزانه: {SITE_POST_SPACING_MINUTES} دقیقه"
+        f"تعداد کلید Gemini: {len(GEMINI_API_KEYS)} | "
+        f"فاصله‌ی پخش روزانه: {MIN_QUEUE_SPACING_MINUTES} تا {MAX_QUEUE_SPACING_MINUTES} دقیقه (متغیر بر اساس حجم صف)"
     )
     while True:
         try:
