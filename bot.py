@@ -36,6 +36,8 @@ GEMINI_API_KEYS = [k.strip() for k in _raw_keys.split(",") if k.strip()]
 POLL_INTERVAL_SECONDS = int(os.environ.get("POLL_INTERVAL_SECONDS", "300"))
 DEDUP_WINDOW_MINUTES = int(os.environ.get("DEDUP_WINDOW_MINUTES", "240"))
 DEDUP_SIMILARITY_THRESHOLD = float(os.environ.get("DEDUP_SIMILARITY_THRESHOLD", "0.6"))
+# فاصله‌ی زمانی پخش پست‌های سایت/باقی‌مانده‌ی شب در طول روز (دقیقه)
+SITE_POST_SPACING_MINUTES = int(os.environ.get("SITE_POST_SPACING_MINUTES", "90"))
 STATE_FILE = "/data/state.json" if os.path.isdir("/data") else "state.json"
 
 GEMINI_MODEL = "gemini-flash-latest"
@@ -44,10 +46,16 @@ GEMINI_API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMI
 FOOTER = "#raptor\n————————\n@khaatshekaan"
 TEHRAN_TZ = ZoneInfo("Asia/Tehran") if ZoneInfo else None
 
+# ساعت پیام صبح‌بخیر: ۸ صبح | ساعت پیام شب‌بخیر و شروع سکوت شبانه: ۰۰:۰۰ (۱۲ شب)
+MORNING_HOUR = 8
+NIGHT_HOUR = 0
+QUIET_START_HOUR = 0   # شروع سکوت شبانه (۱۲ شب)
+QUIET_END_HOUR = 8     # پایان سکوت شبانه (۸ صبح)
+
 MORNING_MESSAGE = "🌅 صبح بخیر به همراهان کانال\nروزتون پر از آرامش و اخبار دقیق باشه 🫡\n\n" + FOOTER
 NIGHT_MESSAGE = "🌙 شب بخیر رپتوری‌های عزیز\nفردا با اخبار تازه در خدمتتون هستیم 🛡️\n\n" + FOOTER
 
-# پرامپت اصلی — دقیقاً طبق ۱۵ قانونی که کاربر مشخص کرده
+# پرامپت اصلی — طبق تمام قوانین کاربر (۱۵ قانون اولیه + تشخیص فوریت خبر)
 REWRITE_PROMPT = """تو یک خبرنگار حرفه‌ای حوزه‌ی نظامی، امنیتی و ژئوپلیتیکی هستی که برای یک کانال تلگرامی گزارش می‌نویسی.
 
 متن ورودی زیر یک محتوای خام از منبع «{source_name}» است. ممکن است شامل یک یا چند خبر جداگانه باشد.
@@ -87,11 +95,14 @@ REWRITE_PROMPT = """تو یک خبرنگار حرفه‌ای حوزه‌ی نظ�
 
 ۱۴. اگر محتوا مربوط به یک منبع خاص (سایت خبری) است و صرفاً یک مقاله‌ی خبری/تحلیلی است (نه چند خبر جدا)، به‌جای پست طولانی، فقط یک چکیده‌ی کوتاه و آماده‌ی انتشار از آن بساز که اطلاعات کلی و مهم را داشته باشد.
 
+۱۵. تشخیص فوریت: مقدار "urgent" را فقط و فقط برای خبرهای واقعاً فوری و لحظه‌ای علامت true بزن — مثل شروع ناگهانی جنگ یا درگیری، حمله‌ی نظامی مستقیم، تشدید حاد بحران، یا زمانی که خود منبع آن را با عناوینی مثل «فوری»، «breaking»، «عاجل» اعلام کرده باشد. برای اخبار عادی، تحلیلی، یا غیرفوری این مقدار را false بگذار.
+
 خروجی را دقیقاً و فقط به‌شکل یک آبجکت JSON معتبر برگردان (بدون Markdown، بدون بک‌تیک، بدون هیچ توضیح اضافه قبل یا بعد از آن)، با این فرمت:
 {{
   "items": [
     {{
       "relevant": true یا false,
+      "urgent": true یا false,
       "title": "تیتر کوتاه فارسی (اگر relevant=false رشته خالی)",
       "body": "متن کامل بازنویسی‌شده شامل پاراگراف‌ها، بدون تکرار تیتر در ابتدای متن (اگر relevant=false رشته خالی)",
       "image_query": "۳ تا ۵ کلمه‌ی انگلیسی کوتاه برای جستجوی یک عکس استوک مرتبط با موضوع این خبر (اگر relevant=false رشته خالی)"
@@ -223,8 +234,8 @@ _key_cursor = {"i": 0}
 def analyze_and_rewrite(text, source_name):
     """
     متن را به Gemini می‌دهد و لیستی از آیتم‌های خبری (هر کدام یک پست جدا) برمی‌گرداند.
-    اگر یک کلید به سقف رایگان (429) بخورد، خودکار به کلید بعدی سوییچ می‌کند.
-    اگر همه‌ی کلیدها در یک دور به سقف خوردند، با تأخیر فزاینده دوباره تلاش می‌کند.
+    اگر یک کلید به سقف رایگان (429) یا سرور موقتاً در دسترس نباشد (500/503)،
+    خودکار به کلید بعدی سوییچ و در صورت نیاز با تأخیر فزاینده دوباره تلاش می‌کند.
     """
     if not GEMINI_API_KEYS:
         raise RuntimeError("هیچ GEMINI_API_KEY/GEMINI_API_KEYS تنظیم نشده است.")
@@ -294,6 +305,16 @@ def find_stock_image(query):
     return None
 
 
+# ---------- دانلود رسانه و آپلود مستقیم به تلگرام (به‌جای فرستادن فقط لینک) ----------
+def download_bytes(url, max_bytes, timeout=30):
+    resp = requests.get(url, timeout=timeout, headers={"User-Agent": "Mozilla/5.0"})
+    resp.raise_for_status()
+    content = resp.content
+    if len(content) > max_bytes:
+        raise ValueError(f"فایل رسانه بزرگ‌تر از حد مجاز است ({len(content)} بایت)")
+    return content
+
+
 # ---------- ارسال به تلگرام ----------
 def send_to_telegram(text):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
@@ -305,18 +326,37 @@ def send_to_telegram(text):
 
 
 def send_photo_to_telegram(caption, photo_url):
+    """
+    ابتدا سعی می‌کند خود فایل عکس را دانلود و مستقیم آپلود کند (روش مطمئن‌تر).
+    اگر دانلود ناموفق بود، به روش قدیمی (فرستادن فقط لینک به تلگرام) برمی‌گردد.
+    """
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
-    payload = {"chat_id": TARGET_CHAT_ID, "photo": photo_url, "caption": caption[:1024], "parse_mode": "HTML"}
-    resp = requests.post(url, json=payload, timeout=30)
+    data = {"chat_id": TARGET_CHAT_ID, "caption": caption[:1024], "parse_mode": "HTML"}
+    try:
+        photo_bytes = download_bytes(photo_url, max_bytes=20 * 1024 * 1024)
+        files = {"photo": ("photo.jpg", photo_bytes)}
+        resp = requests.post(url, data=data, files=files, timeout=60)
+    except Exception as e:
+        log.warning(f"دانلود مستقیم عکس ناموفق بود، تلاش با ارسال لینک: {e}")
+        data["photo"] = photo_url
+        resp = requests.post(url, json=data, timeout=30)
     if not resp.ok:
         log.error(f"خطا در ارسال عکس: {resp.text}")
     resp.raise_for_status()
 
 
 def send_video_to_telegram(caption, video_url):
+    """مشابه send_photo_to_telegram، اول دانلود و آپلود مستقیم، در صورت شکست fallback به لینک."""
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendVideo"
-    payload = {"chat_id": TARGET_CHAT_ID, "video": video_url, "caption": caption[:1024], "parse_mode": "HTML"}
-    resp = requests.post(url, json=payload, timeout=60)
+    data = {"chat_id": TARGET_CHAT_ID, "caption": caption[:1024], "parse_mode": "HTML"}
+    try:
+        video_bytes = download_bytes(video_url, max_bytes=45 * 1024 * 1024)
+        files = {"video": ("video.mp4", video_bytes)}
+        resp = requests.post(url, data=data, files=files, timeout=120)
+    except Exception as e:
+        log.warning(f"دانلود مستقیم فیلم ناموفق بود، تلاش با ارسال لینک: {e}")
+        data["video"] = video_url
+        resp = requests.post(url, json=data, timeout=60)
     if not resp.ok:
         log.error(f"خطا در ارسال فیلم: {resp.text}")
     resp.raise_for_status()
@@ -330,6 +370,25 @@ def build_final_message(title, body):
         parts.append(body)
     parts.append(FOOTER)
     return "\n\n".join(parts)
+
+
+def dispatch_post(final_msg, photo_url, video_url):
+    """پست را با رعایت اولویت فیلم > عکس > فقط‌متن ارسال می‌کند."""
+    sent = False
+    if video_url:
+        try:
+            send_video_to_telegram(final_msg, video_url)
+            sent = True
+        except Exception as e:
+            log.warning(f"ارسال فیلم ناموفق بود: {e}")
+    if not sent and photo_url:
+        try:
+            send_photo_to_telegram(final_msg, photo_url)
+            sent = True
+        except Exception as e:
+            log.warning(f"ارسال عکس ناموفق بود: {e}")
+    if not sent:
+        send_to_telegram(final_msg)
 
 
 # ---------- جلوگیری از پست تکراری (همان رویداد از چند منبع) ----------
@@ -352,6 +411,63 @@ def remember_title(state, title):
     state["_recent_titles"] = recent[-200:]
 
 
+# ---------- صف پخش‌شونده در طول روز (برای پست‌های سایت و باقی‌مانده‌ی شب) ----------
+def enqueue_post(state, title, body, photo_url, video_url, label):
+    queue = state.get("_pending_queue", [])
+    queue.append({
+        "title": title,
+        "body": body,
+        "photo": photo_url,
+        "video": video_url,
+        "label": label,  # "site" یا "night_leftover"
+        "queued_at": time.time(),
+    })
+    state["_pending_queue"] = queue[-300:]
+    save_state(state)
+
+
+def is_quiet_hour(now_dt):
+    if not now_dt:
+        return False
+    return QUIET_START_HOUR <= now_dt.hour < QUIET_END_HOUR
+
+
+def process_queue(state):
+    """در ساعات روز (۸ صبح تا ۱۲ شب)، پست‌های صف‌شده را با فاصله‌ی زمانی منتشر می‌کند."""
+    if not TEHRAN_TZ:
+        return
+    now_dt = datetime.now(TEHRAN_TZ)
+    if is_quiet_hour(now_dt):
+        return  # در ساعت سکوت شبانه چیزی از صف منتشر نمی‌شود
+
+    queue = state.get("_pending_queue", [])
+    if not queue:
+        return
+
+    last_release = state.get("_last_queue_release_ts", 0)
+    elapsed_minutes = (time.time() - last_release) / 60
+    if elapsed_minutes < SITE_POST_SPACING_MINUTES:
+        return
+
+    item = queue.pop(0)
+    state["_pending_queue"] = queue
+
+    title = item.get("title", "")
+    body = item.get("body", "")
+    if item.get("label") == "night_leftover":
+        title = "🕛 (خبر دیشب) " + title
+
+    final_msg = build_final_message(title, body)
+    try:
+        dispatch_post(final_msg, item.get("photo"), item.get("video"))
+        log.info(f"یک پست از صف پخش روزانه ({item.get('label')}) منتشر شد.")
+    except Exception as e:
+        log.error(f"خطا در انتشار پست از صف: {e}")
+
+    state["_last_queue_release_ts"] = time.time()
+    save_state(state)
+
+
 # ---------- پردازش یک منبع ----------
 def process_posts(state, source_key, posts):
     seen_ids = set(state.get(source_key, []))
@@ -362,6 +478,8 @@ def process_posts(state, source_key, posts):
         save_state(state)
         log.info(f"منبع {source_key} برای اولین‌بار ثبت شد، از پست بعدی پردازش می‌شود.")
         return
+
+    is_website_source = source_key.startswith("web:")
 
     for post in new_posts:
         uid = post["uid"]
@@ -382,38 +500,38 @@ def process_posts(state, source_key, posts):
                 title = (result.get("title") or "").strip()
                 body = (result.get("body") or "").strip()
                 image_query = (result.get("image_query") or "").strip()
+                urgent = bool(result.get("urgent"))
 
                 if is_duplicate(state, title):
                     log.info(f"یک آیتم از {uid} به‌عنوان پست تکراری (رویداد مشابه اخیر) رد شد.")
                     continue
 
-                final_msg = build_final_message(title, body)
-
-                # عکس/فیلم اصلی پست فقط برای اولین خبر همان پیام استفاده می‌شود
                 photo_url = post.get("photo") if idx == 0 else None
                 video_url = post.get("video") if idx == 0 else None
                 if not photo_url and not video_url and image_query:
                     photo_url = find_stock_image(image_query)
 
-                sent = False
-                if video_url:
-                    try:
-                        send_video_to_telegram(final_msg, video_url)
-                        sent = True
-                    except Exception as e:
-                        log.warning(f"ارسال فیلم برای {uid} ناموفق بود: {e}")
-                if not sent and photo_url:
-                    try:
-                        send_photo_to_telegram(final_msg, photo_url)
-                        sent = True
-                    except Exception as e:
-                        log.warning(f"ارسال عکس برای {uid} ناموفق بود: {e}")
-                if not sent:
-                    send_to_telegram(final_msg)
+                now_dt = datetime.now(TEHRAN_TZ) if TEHRAN_TZ else None
 
-                remember_title(state, title)
-                log.info(f"یک پست از {uid} با موفقیت منتشر شد.")
-                time.sleep(4)  # فاصله‌ی کوتاه بین چند پست خروجی از یک پیام
+                if is_website_source:
+                    # طبق دستور: خبرهای سایت همیشه در صف پخش روزانه قرار می‌گیرند، هرگز فوری منتشر نمی‌شوند
+                    enqueue_post(state, title, body, photo_url, video_url, label="site")
+                    remember_title(state, title)
+                    log.info(f"یک آیتم از {uid} به صف پخش روزانه اضافه شد.")
+                elif is_quiet_hour(now_dt) and not urgent:
+                    # ساعت سکوت شبانه و خبر فوری نیست → برای فردا صبح ذخیره می‌شود
+                    enqueue_post(state, title, body, photo_url, video_url, label="night_leftover")
+                    remember_title(state, title)
+                    log.info(f"یک آیتم از {uid} به دلیل ساعت سکوت شبانه به صف اضافه شد.")
+                else:
+                    # کانال تلگرام، خارج از سکوت شبانه یا خبر فوری → همین الان منتشر شود
+                    final_msg = build_final_message(title, body)
+                    dispatch_post(final_msg, photo_url, video_url)
+                    remember_title(state, title)
+                    tag = " (فوری، خارج از سکوت شبانه)" if urgent and is_quiet_hour(now_dt) else ""
+                    log.info(f"یک پست از {uid} با موفقیت منتشر شد{tag}.")
+
+                time.sleep(4)  # فاصله‌ی کوتاه بین چند آیتم خروجی از یک پیام
 
         except Exception as e:
             log.error(f"خطا در پردازش {uid}: {e}")
@@ -431,7 +549,7 @@ def check_scheduled_messages(state):
     now = datetime.now(TEHRAN_TZ)
     today_str = now.strftime("%Y-%m-%d")
 
-    if now.hour == 7 and state.get("_last_morning_date") != today_str:
+    if now.hour == MORNING_HOUR and state.get("_last_morning_date") != today_str:
         try:
             send_to_telegram(MORNING_MESSAGE)
             state["_last_morning_date"] = today_str
@@ -440,7 +558,7 @@ def check_scheduled_messages(state):
         except Exception as e:
             log.error(f"خطا در ارسال پیام صبح‌بخیر: {e}")
 
-    if now.hour == 0 and state.get("_last_night_date") != today_str:
+    if now.hour == NIGHT_HOUR and state.get("_last_night_date") != today_str:
         try:
             send_to_telegram(NIGHT_MESSAGE)
             state["_last_night_date"] = today_str
@@ -463,6 +581,7 @@ def process_once(state):
             process_posts(state, f"web:{feed_url}", posts)
 
     check_scheduled_messages(state)
+    process_queue(state)
 
 
 def main():
@@ -480,7 +599,7 @@ def main():
     state = load_state()
     log.info(
         f"ربات شروع به کار کرد. کانال‌ها: {SOURCE_CHANNELS} | سایت‌ها: {len(SOURCE_WEBSITES)} فید | "
-        f"تعداد کلید Gemini: {len(GEMINI_API_KEYS)}"
+        f"تعداد کلید Gemini: {len(GEMINI_API_KEYS)} | فاصله‌ی پخش روزانه: {SITE_POST_SPACING_MINUTES} دقیقه"
     )
     while True:
         try:
