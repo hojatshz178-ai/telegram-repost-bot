@@ -282,16 +282,15 @@ region یکی از این چهار مقدار دقیق باشد:
 
 13) image_query را به انگلیسی و کوتاه، 3 تا 6 کلمه‌ای بده. باید موضوع عکس را دقیق و غیرخیالی بیان کند. اگر تصویر دقیق رویداد در منبع وجود ندارد، عبارت عمومی موضوعی بده؛ ادعا نکن که تصویر دقیق همان رویداد است.
 
-14) نام کانال، نام رسانه، لینک منبع، URL، عبارت «منبع:»، «Source:»، «به نقل از» یا هر نوع ارجاع مستقیم به منبع را داخل title یا body قرار نده؛ خروجی باید به‌صورت مستقل و بدون معرفی منبع منتشر شود.
+14) source_note یک جمله کوتاه باشد که وضعیت منبع را روشن کند؛ مثال:
+«این خبر بر اساس گزارش اولیه منبع است و هنوز به‌طور مستقل تأیید نشده است.»
 
-15) source_note را همیشه رشته خالی برگردان.
-
-16) خروجی فقط JSON معتبر باشد، بدون Markdown و بدون توضیح اضافی.
+15) خروجی فقط JSON معتبر باشد، بدون Markdown و بدون توضیح اضافی.
 
 فرمت:
-{{
+{
   "items": [
-    {{
+    {
       "relevant": true,
       "urgent": false,
       "important": false,
@@ -301,10 +300,10 @@ region یکی از این چهار مقدار دقیق باشد:
       "region": "iran|middle_east|world|superpower",
       "event_type": "military_event|security|defense|geopolitics|routine",
       "priority_hint": 0,
-      "source_note": ""
-    }}
+      "source_note": "..."
+    }
   ]
-}}
+}
 
 متن/پست‌های ورودی:
 ---
@@ -970,12 +969,11 @@ def analyze_and_rewrite(batch_posts, source_name):
         )
 
     content = (
+        f"منبع: {source_name}\n"
         f"این ورودی شامل {len(batch_posts)} پست است. "
         f"اول تشخیص بده کدام‌ها یک رویداد مشترک‌اند و آن‌ها را ادغام کن.\n\n"
         + "\n---\n".join(source_chunks)
     )
-
-    content += "\n\nدستور انتشار: نام کانال/رسانه و هیچ لینک یا URL منبع را در title یا body خروجی نیاور.\n"
 
     prompt = REWRITE_PROMPT.format(
         content=content,
@@ -1582,58 +1580,140 @@ def telegram_request(method, data=None, files=None, timeout=30):
     return payload
 
 
-def send_text_to_telegram(text):
-    # plain text: هیچ مشکل HTML/Markdown ندارد.
-    payload = {
-        "chat_id": TARGET_CHAT_ID,
-        "text": text,
-        "disable_web_page_preview": False,
-    }
+TELEGRAM_TEXT_LIMIT = 4096
+TELEGRAM_CAPTION_LIMIT = 1024
 
-    try:
-        return telegram_request(
-            "sendMessage",
-            data=payload,
-            timeout=30,
-        )
-    except TelegramAPIError as exc:
-        if exc.status_code == 429:
-            log.warning(
-                "Telegram rate limit؛ %s ثانیه صبر می‌کنیم.",
-                exc.retry_after,
-            )
-            time.sleep(exc.retry_after)
-            return telegram_request(
+
+def _split_text_at_boundary(text, max_chars):
+    """Split text without cutting in the middle of a natural sentence/line when possible."""
+    text = (text or "").strip()
+    if len(text) <= max_chars:
+        return text, ""
+
+    part = text[:max_chars]
+    candidates = [
+        part.rfind("\n\n"),
+        part.rfind("\n"),
+        part.rfind(". "),
+        part.rfind("! "),
+        part.rfind("؟ "),
+    ]
+    cut = max(candidates)
+    if cut < max_chars * 0.55:
+        cut = max_chars
+
+    return part[:cut].rstrip(), text[cut:].lstrip()
+
+
+def _split_telegram_text(text, max_chars=TELEGRAM_TEXT_LIMIT):
+    """
+    Split a Telegram text message while keeping FOOTER at the very end.
+    The footer is never sent as a standalone message.
+    """
+    text = (text or "").strip()
+    if len(text) <= max_chars:
+        return [text] if text else []
+
+    footer_suffix = "\n\n" + FOOTER
+    has_footer = text.endswith(FOOTER)
+    main = text[:-len(FOOTER)].rstrip() if has_footer else text
+
+    chunks = []
+    if has_footer:
+        footer_room = max_chars - len(footer_suffix)
+        while len(main) > footer_room:
+            chunk, main = _split_text_at_boundary(main, max_chars)
+            chunks.append(chunk)
+        if main:
+            chunks.append(main + footer_suffix)
+        elif chunks:
+            chunks[-1] = chunks[-1] + footer_suffix
+    else:
+        while main:
+            chunk, main = _split_text_at_boundary(main, max_chars)
+            chunks.append(chunk)
+
+    return [x for x in chunks if x]
+
+
+def send_text_to_telegram(text):
+    # Telegram متن معمولی را حداکثر تا 4096 کاراکتر می‌پذیرد.
+    # اگر متن طولانی باشد، آن را کنترل‌شده تقسیم می‌کنیم تا FOOTER جداگانه ارسال نشود.
+    chunks = _split_telegram_text(text, TELEGRAM_TEXT_LIMIT)
+    last_response = None
+
+    for chunk in chunks:
+        payload = {
+            "chat_id": TARGET_CHAT_ID,
+            "text": chunk,
+            "disable_web_page_preview": False,
+        }
+
+        try:
+            last_response = telegram_request(
                 "sendMessage",
                 data=payload,
                 timeout=30,
             )
-        raise
+        except TelegramAPIError as exc:
+            if exc.status_code == 429:
+                log.warning(
+                    "Telegram rate limit؛ %s ثانیه صبر می‌کنیم.",
+                    exc.retry_after,
+                )
+                time.sleep(exc.retry_after)
+                last_response = telegram_request(
+                    "sendMessage",
+                    data=payload,
+                    timeout=30,
+                )
+            else:
+                raise
+
+    return last_response
 
 
-def split_media_caption(title, body, footer, max_chars=1024):
+def split_media_caption(title, body, footer, max_chars=TELEGRAM_CAPTION_LIMIT):
+    """
+    برای پست‌های دارای عکس/ویدیو، تا جای ممکن footer را داخل همان caption
+    نگه می‌دارد. اگر body از ظرفیت caption بیشتر باشد، ادامهٔ متن به پیام
+    بعدی می‌رود و footer در انتهای همان پیامِ ادامه قرار می‌گیرد؛ footer
+    هیچ‌وقت به‌تنهایی ارسال نمی‌شود.
+    """
     first = normalize_space(title)
     rest = body.strip()
+    footer_block = "\n\n" + footer
 
-    caption = first[:max_chars]
-    remaining_body = rest
+    # اگر عنوان + کل متن + footer داخل caption جا شود، همه را در همان پیام می‌فرستیم.
+    full_caption = "\n\n".join(x for x in (first, rest) if x)
+    if len(full_caption) + len(footer_block) <= max_chars:
+        return full_caption + footer_block, ""
 
-    if remaining_body:
-        room = max_chars - len(caption) - 2
-        if room > 120:
-            body_part = truncate_text(remaining_body, room)
-            caption = f"{caption}\n\n{body_part}"
-            remaining_body = remaining_body[len(body_part.rstrip("…")):].lstrip()
+    # اول عنوان را نگه می‌داریم و از body به اندازه‌ای استفاده می‌کنیم که footer
+    # نیز در همان caption جا شود.
+    title_block = first
+    room_for_body = max_chars - len(title_block) - len(footer_block) - 2
 
-    # Footer را در پیام متنی کامل می‌گذاریم تا کپشن بیش از حد طولانی نشود.
-    remaining = remaining_body
-    if remaining:
-        remaining = f"{remaining}\n\n{footer}"
-    else:
-        # اگر همه body داخل کپشن جا شد، footer را با پیام body کوچک ادغام می‌کنیم.
-        remaining = footer
+    if room_for_body > 120 and rest:
+        body_part = truncate_text(rest, room_for_body)
+        caption = "\n\n".join(x for x in (title_block, body_part) if x)
+        remaining_body = rest[len(body_part.rstrip("…")):].lstrip()
 
-    return caption[:max_chars], remaining
+        # اگر به دلیل طول عنوان/فاصله‌ها caption هنوز جا نداشت، footer را به ادامه منتقل می‌کنیم.
+        if len(caption) + len(footer_block) <= max_chars:
+            return caption, (remaining_body + footer_block).strip() if remaining_body else footer
+
+    # عنوان به‌تنهایی هم جا برای footer ندارد؛ footer را به انتهای پیام ادامه می‌بریم.
+    if len(title_block) + len(footer_block) <= max_chars:
+        return title_block, (rest + footer_block).strip() if rest else footer
+
+    # عنوان خیلی طولانی است؛ آن را هم کوتاه می‌کنیم و footer را در ادامه می‌گذاریم.
+    title_room = max(1, max_chars - len(footer_block) - 2)
+    short_title = truncate_text(title_block, title_room)
+    remaining = title_block[len(short_title.rstrip("…")):].lstrip()
+    if rest:
+        remaining = "\n\n".join(x for x in (remaining, rest) if x)
+    return short_title, (remaining + footer_block).strip() if remaining else footer
 
 
 def send_photo_to_telegram(title, body, photo_url):
@@ -1731,12 +1811,18 @@ def send_video_to_telegram(title, body, video_url):
 def build_text_only_message(item):
     title = normalize_space(item.get("title", ""))
     body = (item.get("body", "") or "").strip()
+    source_note = (item.get("source_note", "") or "").strip()
+    source_url = item.get("source_url", "")
+
     parts = []
     if title:
         parts.append(title)
     if body:
         parts.append(body)
-    # لینک/نام منبع عمداً در پست نهایی نمایش داده نمی‌شود.
+    if source_note:
+        parts.append(f"یادداشت منبع: {source_note}")
+    if source_url:
+        parts.append(format_source_link("منبع", source_url))
     parts.append(FOOTER)
 
     return "\n\n".join(parts)
@@ -1745,11 +1831,17 @@ def build_text_only_message(item):
 def dispatch_item(item):
     title = normalize_space(item.get("title", ""))
     body = (item.get("body", "") or "").strip()
+    source_note = (item.get("source_note", "") or "").strip()
+    source_url = item.get("source_url", "")
     photo = item.get("photo")
     video = item.get("video")
 
-    # لینک/نام منبع عمداً در کپشن نهایی نمایش داده نمی‌شود.
-    media_body = body
+    media_body_parts = [body]
+    if source_note:
+        media_body_parts.append(f"یادداشت منبع: {source_note}")
+    if source_url:
+        media_body_parts.append(format_source_link("منبع", source_url))
+    media_body = "\n\n".join(x for x in media_body_parts if x)
 
     if video:
         try:
