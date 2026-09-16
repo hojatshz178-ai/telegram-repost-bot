@@ -29,7 +29,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("repost-bot")
 
-APP_VERSION = "4.0.0"
+APP_VERSION = "4.0.1"
 USER_AGENT = "Mozilla/5.0 (compatible; TelegramMilitaryNewsBot/4.0)"
 
 # ----------------------------- Environment ----------------------------------
@@ -587,15 +587,24 @@ def _extract_gemini_text(data: Dict[str, Any]) -> str:
 
 
 def _parse_json_output(raw: str) -> Dict[str, Any]:
+    cleaned = (raw or "").strip()
+    if cleaned.startswith("```json"):
+        cleaned = cleaned[7:]
+    elif cleaned.startswith("```"):
+        cleaned = cleaned[3:]
+    if cleaned.endswith("```"):
+        cleaned = cleaned[:-3]
+    cleaned = cleaned.strip()
+
     try:
-        value = json.loads(raw)
+        value = json.loads(cleaned)
     except json.JSONDecodeError:
-        # Defensive fallback only; structured output should make this unnecessary.
-        start = raw.find("{")
-        end = raw.rfind("}")
+        # Defensive fallback for a model that adds a short sentence around the JSON.
+        start = cleaned.find("{")
+        end = cleaned.rfind("}")
         if start < 0 or end <= start:
             raise ValueError(f"خروجی JSON قابل‌پارس نبود: {raw[:400]}")
-        value = json.loads(raw[start:end + 1])
+        value = json.loads(cleaned[start:end + 1])
     if not isinstance(value, dict):
         raise ValueError("خروجی Gemini باید یک JSON object باشد.")
     return value
@@ -609,16 +618,14 @@ def analyze_and_rewrite(state: Dict[str, Any], text: str, source_name: str) -> L
 
     text = text[:MAX_GEMINI_INPUT_CHARS]
     prompt = REWRITE_PROMPT.format(content=text, source_name=source_name)
+    # Do NOT send generationConfig.responseFormat here.
+    # The current REST generateContent endpoint accepts responseMimeType in
+    # generationConfig, but some Gemini routes/projects reject the newer
+    # responseFormat.text.mimeType shape with HTTP 400. Since the prompt already
+    # requires strict JSON, we keep the request maximally compatible and parse
+    # the returned JSON ourselves below.
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {
-            "responseFormat": {
-                "text": {
-                    "mimeType": "application/json",
-                    "schema": GEMINI_SCHEMA,
-                }
-            },
-        },
     }
 
     attempted = set()
