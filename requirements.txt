@@ -1,2 +1,4 @@
-requests>=2.31.0
-tzdata>=2024.1
+requests>=2.32.3,<3
+# ZoneInfo on Linux normally uses the system tz database; this keeps the
+# Asia/Tehran database available on minimal deployments.
+tzdata>=2025.2,<2027
