@@ -3,7 +3,6 @@ import re
 import json
 import time
 import html
-import calendar
 import logging
 import difflib
 from datetime import datetime
@@ -16,16 +15,6 @@ try:
 except ImportError:
     ZoneInfo = None
 
-try:
-    import feedparser
-except ImportError:
-    feedparser = None
-
-try:
-    from bs4 import BeautifulSoup
-except ImportError:
-    BeautifulSoup = None
-
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("repost-bot")
 
@@ -35,7 +24,6 @@ log = logging.getLogger("repost-bot")
 # =========================================================================
 
 SOURCE_CHANNELS = [c.strip().lstrip("@") for c in os.environ.get("SOURCE_CHANNELS", "").split(",") if c.strip()]
-SOURCE_WEBSITES = [u.strip() for u in os.environ.get("SOURCE_WEBSITES", "").split(",") if u.strip()]
 TARGET_CHAT_ID = os.environ.get("TARGET_CHAT_ID", "")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 
@@ -43,25 +31,26 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 _raw_keys = os.environ.get("GEMINI_API_KEYS") or os.environ.get("GEMINI_API_KEY", "")
 GEMINI_API_KEYS = [k.strip() for k in _raw_keys.split(",") if k.strip()]
 
-# نسخه‌ی مدل Gemini را عمداً «پین» (ثابت) می‌کنیم، نه یک نام مستعار مثل
-# gemini-flash-latest که بدون اطلاع شما ممکن است به مدل دیگری اشاره کند.
-# اگر گوگل این نسخه را بازنشسته کرد، کافی است همین متغیر محیطی را در Railway عوض کنید.
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
-GEMINI_API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+# چند مدل Gemini هم پشتیبانی می‌شود: اگر یک مدل مدام ۵۰۳/سقف رایگان بدهد،
+# خودکار مدل بعدی امتحان می‌شود. مدل‌های lite معمولاً سقف درخواست بیشتر
+# و در دسترس‌بودن بهتری نسبت به gemini-2.5-flash معمولی دارند.
+_raw_models = os.environ.get("GEMINI_MODELS") or os.environ.get("GEMINI_MODEL", "")
+GEMINI_MODELS = [m.strip() for m in _raw_models.split(",") if m.strip()] or [
+    "gemini-2.5-flash-lite",
+    "gemini-2.0-flash-lite",
+]
 
-# کلید سرویس عکس استوک Pexels (رایگان). اگر ست نشود، پست‌های سایتیِ بدون عکس
-# اصلی صرفاً بدون عکس منتشر می‌شوند (به‌جای تلاش برای سرویس از‌کارافتاده‌ی قبلی).
+# کلید سرویس عکس استوک Pexels (رایگان، اختیاری). اگر پست تلگرامی خودش عکس/فیلم
+# نداشت، از این برای یک عکس استوکِ مرتبط از نظر موضوعی استفاده می‌شود.
 PEXELS_API_KEY = os.environ.get("PEXELS_API_KEY", "")
 
 POLL_INTERVAL_SECONDS = int(os.environ.get("POLL_INTERVAL_SECONDS", "300"))
 
-# جلوگیری از پست تکراری یک رویداد از چند منبع مختلف
+# جلوگیری از پست تکراری یک رویداد از چند کانال مختلف
 DEDUP_WINDOW_MINUTES = int(os.environ.get("DEDUP_WINDOW_MINUTES", "240"))
 DEDUP_SIMILARITY_THRESHOLD = float(os.environ.get("DEDUP_SIMILARITY_THRESHOLD", "0.72"))
 
-# فاصله‌ی زمانی پخش پست‌های صف (سایت‌ها + باقی‌مانده‌ی شب) در طول روز — بازه‌ی متغیر:
-# وقتی صف خلوته به سقف (MAX) نزدیک می‌شه؛ وقتی صف شلوغ می‌شه خودکار کم می‌شه؛
-# ولی هیچ‌وقت از کف (MIN) پایین‌تر نمی‌ره.
+# فاصله‌ی زمانی پخش صفِ باقی‌مانده‌ی شب در طول روز — بازه‌ی متغیر بین MIN و MAX
 MAX_QUEUE_SPACING_MINUTES = int(os.environ.get("SITE_POST_SPACING_MINUTES", "60"))
 MIN_QUEUE_SPACING_MINUTES = int(os.environ.get("SITE_POST_MIN_SPACING_MINUTES", "30"))
 
@@ -76,13 +65,8 @@ QUEUE_PURGE_KEEP_PRIORITY_MAX = int(os.environ.get("QUEUE_PURGE_KEEP_PRIORITY_MA
 # به‌طور نهایی کنار گذاشته می‌شود (تا یک پست خراب برای همیشه صف را قفل نکند).
 MAX_RETRY_ATTEMPTS = int(os.environ.get("MAX_RETRY_ATTEMPTS", "3"))
 
-# اگر خلاصه‌ی RSS کوتاه‌تر از این مقدار باشد، تلاش می‌کنیم متن کامل مقاله را از خود صفحه بگیریم.
-RSS_MIN_SUMMARY_CHARS = int(os.environ.get("RSS_MIN_SUMMARY_CHARS", "400"))
-# مقاله‌های قدیمی‌تر از این تعداد ساعت، حتی اگر تازه در فید ظاهر شده باشند، پردازش نمی‌شوند.
-RSS_MAX_ARTICLE_AGE_HOURS = int(os.environ.get("RSS_MAX_ARTICLE_AGE_HOURS", "48"))
-
-# اگر یک منبع (کانال/سایت) پشت‌سرهم در گرفتن اطلاعات خطا بدهد، به‌جای تلاش مجدد
-# در هر چرخه، با فاصله‌ی فزاینده (تا سقف یک ساعت) موقتاً کنار گذاشته می‌شود.
+# اگر یک کانال پشت‌سرهم در گرفتن اطلاعات خطا بدهد، به‌جای تلاش مجدد در هر چرخه،
+# با فاصله‌ی فزاینده (تا سقف یک ساعت) موقتاً کنار گذاشته می‌شود.
 SOURCE_COOLDOWN_BASE_SECONDS = int(os.environ.get("SOURCE_COOLDOWN_BASE_SECONDS", "300"))
 SOURCE_COOLDOWN_MAX_SECONDS = int(os.environ.get("SOURCE_COOLDOWN_MAX_SECONDS", "3600"))
 
@@ -100,8 +84,6 @@ QUIET_END_HOUR = 8
 MORNING_MESSAGE = "🌅 صبح بخیر به همراهان کانال\nروزتون پر از آرامش و اخبار دقیق باشه 🫡\n\n" + FOOTER
 NIGHT_MESSAGE = "🌙 شب بخیر رپتوری‌های عزیز\nفردا با اخبار تازه در خدمتتون هستیم 🛡️\n\n" + FOOTER
 
-# پیش‌فیلتر ارزان قبل از صرف یک درخواست Gemini — فقط برای فیلتر کردن موارد
-# آشکارا تبلیغاتی/بی‌محتوا؛ تشخیص نهایی ارتباط همچنان بر عهده‌ی خود Gemini است.
 _AD_KEYWORDS = [
     "تبلیغ", "اسپانسر", "تخفیف ویژه", "لینک عضویت", "خرید از", "کد تخفیف",
     "دعوت از دوستان", "جوین شوید", "کانال ما را دنبال کنید", "پروموشن",
@@ -149,18 +131,16 @@ REWRITE_PROMPT = """تو یک خبرنگار حرفه‌ای حوزه‌ی نظ�
 
 ۱۳. لحن طبیعی: متن باید طبیعی و شبیه نوشته‌ی یک خبرنگار حوزه‌ی دفاعی باشد، نه ترجمه‌ی گوگل. از تکرار عبارت‌های کلیشه‌ای خودداری کن. متن را برای خواندن در تلگرام پاراگراف‌بندی کن.
 
-۱۴. مقالات سایت: اگر محتوا صرفاً یک مقاله‌ی خبری/تحلیلی از یک سایت است (نه چند خبر جدا)، به‌جای پست طولانی، فقط یک چکیده‌ی کوتاه و آماده‌ی انتشار از آن بساز.
+۱۴. تشخیص فوریت («urgent»): مقدار "urgent" را فقط برای خبرهای واقعاً فوری و لحظه‌ای علامت true بزن — شروع ناگهانی جنگ یا درگیری، حمله‌ی نظامی مستقیم، تشدید حاد بحران، یا وقتی خود منبع آن را «فوری»/«breaking» اعلام کرده. برای اخبار عادی یا تحلیلی این مقدار را false بگذار.
 
-۱۵. تشخیص فوریت («urgent»): مقدار "urgent" را فقط برای خبرهای واقعاً فوری و لحظه‌ای علامت true بزن — شروع ناگهانی جنگ یا درگیری، حمله‌ی نظامی مستقیم، تشدید حاد بحران، یا وقتی خود منبع آن را «فوری»/«breaking» اعلام کرده. برای اخبار عادی یا تحلیلی این مقدار را false بگذار.
-
-۱۶. سطح‌بندی اولویت («priority» از ۱ تا ۴)، به این ترتیب اهمیت:
+۱۵. سطح‌بندی اولویت («priority» از ۱ تا ۴)، به این ترتیب اهمیت:
    - سطح ۱: رویداد نظامی در حال وقوع (جنگ، حمله، درگیری مسلحانه فعال).
    - سطح ۲: مرتبط با خاورمیانه یا ایران (و سطح ۱ نیست).
    - سطح ۳: مرتبط با قدرت‌های بزرگ جهانی (آمریکا، روسیه، چین، ناتو و مشابه) ولی مرتبط با خاورمیانه/ایران یا رویداد نظامی فعال نیست.
    - سطح ۴: سایر اخبار عادی جهان.
    توجه: این فقط برای اولویت *زمان انتشار* است؛ اخبار سطح ۴ باید همچنان (برای حفظ تنوع پوشش) منتشر شوند، فقط ممکن است دیرتر نوبتشان برسد.
 
-۱۷. اعتبارسنجی خودت: پیش از نهایی‌کردن پاسخ، یک‌بار مرور کن که تیتر و متن با محتوای ورودی همخوانی کامل دارند و هیچ نام، عدد، تاریخ یا مکانی اشتباه/جابه‌جا نشده باشد.
+۱۶. اعتبارسنجی خودت: پیش از نهایی‌کردن پاسخ، یک‌بار مرور کن که تیتر و متن با محتوای ورودی همخوانی کامل دارند و هیچ نام، عدد، تاریخ یا مکانی اشتباه/جابه‌جا نشده باشد.
 
 خروجی را دقیقاً و فقط به‌شکل یک آبجکت JSON معتبر برگردان (بدون Markdown، بدون بک‌تیک، بدون هیچ توضیح اضافه)، با این فرمت دقیق:
 {{
@@ -207,8 +187,6 @@ def load_state():
 
 
 def save_state(state):
-    """نوشتن اتمیک: اول در یک فایل موقت نوشته می‌شود، بعد جایگزین فایل اصلی می‌شود —
-    تا اگر برنامه وسط نوشتن متوقف شد، فایل state هرگز نیمه‌نوشته/خراب نماند."""
     tmp_path = STATE_FILE + ".tmp"
     with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
@@ -220,7 +198,6 @@ def save_state(state):
     os.replace(tmp_path, STATE_FILE)
 
 
-# ---- کمک‌تابع‌های شمارنده‌ی تلاش مجدد (برای جلوگیری از گم‌شدن دائمی پست هنگام خطا) ----
 def get_retry_count(state, retry_key):
     return state.get("_retry_counts", {}).get(retry_key, 0)
 
@@ -237,7 +214,6 @@ def clear_retry_count(state, retry_key):
         del counts[retry_key]
 
 
-# ---- کمک‌تابع‌های cooldown برای منابعی که پشت‌سرهم خطا می‌دهند ----
 def is_source_in_cooldown(state, source_key):
     cooldowns = state.get("_source_cooldowns", {})
     until = cooldowns.get(source_key, 0)
@@ -270,17 +246,15 @@ def register_source_success(state, source_key):
 
 
 # =========================================================================
-# بخش ۴: گرفتن پست از کانال‌های تلگرام (صفحه‌ی پیش‌نمایش عمومی)
+# بخش ۴: گرفتن پست از کانال‌های تلگرام (صفحه‌ی پیش‌نمایش عمومی) — تنها منبع ربات
 # =========================================================================
 
 def fetch_channel_posts(channel):
     """
     صفحه‌ی پیش‌نمایش عمومی کانال را می‌گیرد و پست‌ها (متن + همه‌ی عکس‌های آلبوم + فیلم) را
-    استخراج می‌کند. در صورت خطای شبکه/HTTP مقدار None برمی‌گرداند (نه لیست خالی) تا با
-    «هیچ پست جدیدی نبود» اشتباه گرفته نشود و منبع بتواند وارد چرخه‌ی cooldown شود.
+    استخراج می‌کند. در صورت خطای شبکه/HTTP مقدار None برمی‌گرداند (نه لیست خالی).
     توجه: این روش بر پایه‌ی اسکرپ HTML صفحه‌ی عمومی است، نه API رسمی تلگرام؛ فقط برای
-    کانال‌های پابلیک کار می‌کند و اگر تلگرام ساختار این صفحه را تغییر دهد ممکن است نیاز
-    به به‌روزرسانی regexها داشته باشد.
+    کانال‌های پابلیک کار می‌کند.
     """
     url = f"https://t.me/s/{channel}"
     try:
@@ -308,7 +282,6 @@ def fetch_channel_posts(channel):
             text = re.sub(r"<[^>]+>", "", text)
             text = html.unescape(text).strip()
 
-        # همه‌ی عکس‌های موجود در این پست را می‌گیریم (پشتیبانی از آلبوم چندعکسی)
         photo_urls = re.findall(
             r'tgme_widget_message_photo_wrap[^"]*"\s+style="[^"]*background-image:url\(\'([^\']+)\'\)', block
         )
@@ -332,105 +305,7 @@ def fetch_channel_posts(channel):
 
 
 # =========================================================================
-# بخش ۵: گرفتن مطالب از سایت‌های خبری (RSS) با غنی‌سازی خلاصه‌ی کوتاه
-# =========================================================================
-
-def fetch_full_article_text(article_url):
-    """اگر خلاصه‌ی RSS خیلی کوتاه بود، تلاش می‌کند متن کامل مقاله را از خود صفحه استخراج کند."""
-    if BeautifulSoup is None:
-        return None
-    try:
-        resp = requests.get(article_url, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
-        resp.raise_for_status()
-    except Exception as e:
-        log.warning(f"دریافت متن کامل مقاله‌ی {article_url} ناموفق بود: {e}")
-        return None
-    try:
-        soup = BeautifulSoup(resp.text, "html.parser")
-        for tag in soup(["script", "style", "nav", "header", "footer", "aside", "form"]):
-            tag.decompose()
-        paragraphs = soup.find_all("p")
-        text = "\n".join(p.get_text(" ", strip=True) for p in paragraphs)
-        text = re.sub(r"\n{3,}", "\n\n", text).strip()
-        return text[:6000] if text else None
-    except Exception as e:
-        log.warning(f"استخراج متن مقاله‌ی {article_url} ناموفق بود: {e}")
-        return None
-
-
-def fetch_website_posts(feed_url):
-    """
-    فید RSS را می‌خواند. در صورت خطا None برمی‌گرداند (نه لیست خالی).
-    مقاله‌های قدیمی‌تر از RSS_MAX_ARTICLE_AGE_HOURS نادیده گرفته می‌شوند، و اگر خلاصه
-    خیلی کوتاه باشد، تلاش می‌شود متن کامل مقاله از خود صفحه گرفته شود.
-    """
-    if feedparser is None:
-        log.error("کتابخانه feedparser نصب نیست؛ نمی‌توان فید سایت را خواند.")
-        return None
-    try:
-        parsed = feedparser.parse(feed_url)
-        if getattr(parsed, "bozo", False) and not parsed.entries:
-            raise ValueError(getattr(parsed, "bozo_exception", "خطای نامشخص در پارس فید"))
-    except Exception as e:
-        log.warning(f"خطا در خواندن فید {feed_url}: {e}")
-        return None
-
-    posts = []
-    now_ts = time.time()
-    for entry in parsed.entries[:20]:
-        raw_id = entry.get("id") or entry.get("link")
-        if not raw_id:
-            fallback_source = (entry.get("title", "") + entry.get("summary", ""))
-            raw_id = f"hash:{abs(hash(fallback_source))}"
-        uid = f"web:{feed_url}:{raw_id}"
-
-        published_struct = entry.get("published_parsed") or entry.get("updated_parsed")
-        if published_struct:
-            try:
-                published_ts = calendar.timegm(published_struct)
-                age_hours = (now_ts - published_ts) / 3600
-                if age_hours > RSS_MAX_ARTICLE_AGE_HOURS:
-                    continue
-            except Exception:
-                pass
-
-        title = entry.get("title", "").strip()
-        summary = entry.get("summary", "") or entry.get("description", "")
-        summary = re.sub(r"<[^>]+>", " ", summary)
-        summary = html.unescape(summary).strip()
-
-        if len(summary) < RSS_MIN_SUMMARY_CHARS and entry.get("link"):
-            full_text = fetch_full_article_text(entry["link"])
-            if full_text and len(full_text) > len(summary):
-                summary = full_text
-
-        content = f"{title}\n\n{summary}".strip()
-
-        photo_url = None
-        if entry.get("media_content"):
-            photo_url = entry["media_content"][0].get("url")
-        elif entry.get("media_thumbnail"):
-            photo_url = entry["media_thumbnail"][0].get("url")
-        elif entry.get("links"):
-            for link in entry["links"]:
-                if link.get("type", "").startswith("image"):
-                    photo_url = link.get("href")
-                    break
-
-        if content:
-            posts.append({
-                "uid": uid,
-                "text": content,
-                "photo": photo_url,
-                "photos": None,
-                "video": None,
-                "source_name": parsed.feed.get("title", feed_url),
-            })
-    return posts
-
-
-# =========================================================================
-# بخش ۶: پیش‌فیلتر ارزان قبل از صرف درخواست Gemini
+# بخش ۵: پیش‌فیلتر ارزان قبل از صرف درخواست Gemini
 # =========================================================================
 
 def looks_like_spam_or_trivial(text):
@@ -454,17 +329,31 @@ def validate_item(result):
 
 
 # =========================================================================
-# بخش ۷: ارتباط با Gemini — چرخش بین چند کلید + مدیریت کامل خطاها
+# بخش ۶: ارتباط با Gemini — چرخش بین چند کلید *و* چند مدل + مدیریت کامل خطاها
 # =========================================================================
 
-_key_cursor = {"i": 0}
+# ترکیب همه‌ی (کلید، مدل)ها را یک‌بار می‌سازیم: اول همه‌ی کلیدها با مدل اول،
+# بعد همه‌ی کلیدها با مدل دوم. چون این cursor سطح ماژول است و بین فراخوانی‌های
+# مختلف باقی می‌ماند، در طول زمان به‌طور طبیعی هم بین کلیدها و هم بین مدل‌ها می‌چرخد.
+def _build_key_model_combos():
+    return [(k, m) for m in GEMINI_MODELS for k in GEMINI_API_KEYS]
+
+
+_COMBOS = _build_key_model_combos()
+_combo_cursor = {"i": 0}
 
 _ROTATABLE_STATUS_CODES = (401, 403, 429, 500, 503)
+
+
+def _gemini_url_for_model(model_name):
+    return f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent"
 
 
 def analyze_and_rewrite(text, source_name):
     if not GEMINI_API_KEYS:
         raise RuntimeError("هیچ GEMINI_API_KEY/GEMINI_API_KEYS تنظیم نشده است.")
+    if not _COMBOS:
+        raise RuntimeError("ترکیب کلید/مدل Gemini ساخته نشد.")
 
     payload = {
         "contents": [{"parts": [{"text": REWRITE_PROMPT.format(content=text, source_name=source_name)}]}],
@@ -475,47 +364,50 @@ def analyze_and_rewrite(text, source_name):
     max_cycles = 3
     last_response = None
     last_error = None
+    last_model_used = None
 
     for cycle in range(max_cycles):
         got_success = False
-        for _ in range(len(GEMINI_API_KEYS)):
-            key = GEMINI_API_KEYS[_key_cursor["i"] % len(GEMINI_API_KEYS)]
-            _key_cursor["i"] += 1
+        for _ in range(len(_COMBOS)):
+            key, model = _COMBOS[_combo_cursor["i"] % len(_COMBOS)]
+            _combo_cursor["i"] += 1
             headers = {"Content-Type": "application/json", "X-goog-api-key": key}
+            url = _gemini_url_for_model(model)
             try:
-                resp = requests.post(GEMINI_API_URL, headers=headers, json=payload, timeout=60)
+                resp = requests.post(url, headers=headers, json=payload, timeout=60)
             except requests.RequestException as e:
                 last_error = e
-                log.warning(f"خطای شبکه هنگام تماس با Gemini ({e})؛ تلاش با کلید بعدی...")
+                log.warning(f"خطای شبکه هنگام تماس با Gemini (مدل {model})؛ ({e})؛ تلاش با ترکیب بعدی...")
                 continue
 
             last_response = resp
+            last_model_used = model
             if resp.status_code not in _ROTATABLE_STATUS_CODES:
                 got_success = True
                 break
 
             if resp.status_code == 429:
-                log.warning("یکی از کلیدهای Gemini به سقف رایگان خورد؛ سوییچ به کلید بعدی...")
+                log.warning(f"سقف رایگان مدل {model} با یکی از کلیدها پر شد؛ سوییچ به ترکیب بعدی...")
             elif resp.status_code in (401, 403):
-                log.warning(f"یکی از کلیدهای Gemini نامعتبر/بی‌اعتبارشده است (کد {resp.status_code})؛ سوییچ به کلید بعدی...")
+                log.warning(f"یکی از کلیدهای Gemini نامعتبر/بی‌اعتبارشده است (کد {resp.status_code})؛ سوییچ به ترکیب بعدی...")
             else:
-                log.warning(f"سرور Gemini موقتاً در دسترس نیست (کد {resp.status_code})؛ تلاش با کلید بعدی...")
+                log.warning(f"سرور Gemini (مدل {model}) موقتاً در دسترس نیست (کد {resp.status_code})؛ تلاش با ترکیب بعدی...")
 
         if got_success:
             break
 
-        log.warning(f"در این دور با هیچ کلیدی موفق نشدیم؛ {wait_seconds} ثانیه صبر می‌کنیم...")
+        log.warning(f"در این دور با هیچ ترکیب کلید/مدلی موفق نشدیم؛ {wait_seconds} ثانیه صبر می‌کنیم...")
         time.sleep(wait_seconds)
         wait_seconds = min(wait_seconds * 2, 120)
 
     if last_response is None:
-        raise RuntimeError(f"تماس با Gemini برای همه‌ی کلیدها با خطای شبکه مواجه شد: {last_error}")
+        raise RuntimeError(f"تماس با Gemini برای همه‌ی ترکیب‌ها با خطای شبکه مواجه شد: {last_error}")
 
     last_response.raise_for_status()
     data = last_response.json()
     candidates = data.get("candidates", [])
     if not candidates:
-        raise ValueError(f"پاسخ نامعتبر از Gemini: {data}")
+        raise ValueError(f"پاسخ نامعتبر از Gemini (مدل {last_model_used}): {data}")
     parts = candidates[0].get("content", {}).get("parts", [])
     raw = "\n".join(p.get("text", "") for p in parts).strip()
 
@@ -555,7 +447,7 @@ def find_stock_image(query):
 
 
 # =========================================================================
-# بخش ۸: ارتباط با تلگرام — با مدیریت flood-control (retry_after) و آپلود مستقیم فایل
+# بخش ۷: ارتباط با تلگرام — با مدیریت flood-control (retry_after) و آپلود مستقیم فایل
 # =========================================================================
 
 def download_bytes(url, max_bytes, timeout=30):
@@ -715,7 +607,7 @@ def dispatch_post(title, body, photo_url=None, video_url=None, photos=None):
 
 
 # =========================================================================
-# بخش ۹: جلوگیری از پست تکراری (رویداد مشابه از چند منبع مختلف)
+# بخش ۸: جلوگیری از پست تکراری (رویداد مشابه از چند کانال مختلف)
 # =========================================================================
 
 def _dedup_signature(title, body):
@@ -744,10 +636,10 @@ def remember_title(state, title, body):
 
 
 # =========================================================================
-# بخش ۱۰: صف پخش‌شونده در طول روز — اولویت ۴سطحی + فاصله‌ی زمانی پویا
+# بخش ۹: صف پخش‌شونده در طول روز — فقط برای باقی‌مانده‌ی سکوت شبانه
 # =========================================================================
 
-def enqueue_post(state, title, body, photo_url, video_url, photos, label, priority):
+def enqueue_post(state, title, body, photo_url, video_url, photos, priority):
     queue = state.get("_pending_queue", [])
     item = {
         "title": title,
@@ -755,7 +647,7 @@ def enqueue_post(state, title, body, photo_url, video_url, photos, label, priori
         "photo": photo_url,
         "photos": photos,
         "video": video_url,
-        "label": label,
+        "label": "night_leftover",
         "priority": priority,
         "queued_at": time.time(),
     }
@@ -804,16 +696,13 @@ def process_queue(state):
     item = queue.pop(0)
     state["_pending_queue"] = queue
 
-    title = item.get("title", "")
+    title = "🕛 (خبر دیشب) " + item.get("title", "")
     body = item.get("body", "")
-    if item.get("label") == "night_leftover":
-        title = "🕛 (خبر دیشب) " + title
 
     try:
         dispatch_post(title, body, item.get("photo"), item.get("video"), item.get("photos"))
         log.info(
-            f"یک پست از صف پخش روزانه منتشر شد "
-            f"(نوع={item.get('label')}, اولویت={item.get('priority')}). "
+            f"یک پست از صف باقی‌مانده‌ی شب منتشر شد (اولویت={item.get('priority')}). "
             f"فاصله‌ی محاسبه‌شده تا پست بعدی: {round(spacing_minutes)} دقیقه."
         )
     except Exception as e:
@@ -841,10 +730,10 @@ def purge_low_priority_queue(state, today_str):
 
 
 # =========================================================================
-# بخش ۱۱: پردازش یک نتیجه‌ی تک‌آیتمی از Gemini (منطق مشترک روتینگ)
+# بخش ۱۰: پردازش یک نتیجه‌ی تک‌آیتمی از Gemini (منطق مشترک روتینگ)
 # =========================================================================
 
-def handle_result_item(state, result, is_website_source, photo_url, video_url, photos, source_label):
+def handle_result_item(state, result, photo_url, video_url, photos, source_label):
     if not result.get("relevant"):
         log.info(f"یک آیتم از {source_label} نامرتبط تشخیص داده شد و رد شد.")
         return
@@ -872,28 +761,19 @@ def handle_result_item(state, result, is_website_source, photo_url, video_url, p
 
     now_dt = datetime.now(TEHRAN_TZ) if TEHRAN_TZ else None
 
-    if urgent:
+    if urgent or not is_quiet_hour(now_dt):
         dispatch_post(title, body, photo_url, video_url, photos)
         remember_title(state, title, body)
-        log.info(f"یک پست فوری از {source_label} بلافاصله منتشر شد (اولویت={priority}).")
-        return
-
-    if is_website_source:
-        enqueue_post(state, title, body, photo_url, video_url, photos, label="site", priority=priority)
-        remember_title(state, title, body)
-        log.info(f"یک آیتم از {source_label} به صف پخش روزانه اضافه شد (اولویت={priority}).")
-    elif is_quiet_hour(now_dt):
-        enqueue_post(state, title, body, photo_url, video_url, photos, label="night_leftover", priority=priority)
+        tag = " (فوری، در سکوت شبانه)" if urgent and is_quiet_hour(now_dt) else ""
+        log.info(f"یک پست از {source_label} با موفقیت منتشر شد{tag} (اولویت={priority}).")
+    else:
+        enqueue_post(state, title, body, photo_url, video_url, photos, priority=priority)
         remember_title(state, title, body)
         log.info(f"یک آیتم از {source_label} به دلیل ساعت سکوت شبانه به صف اضافه شد (اولویت={priority}).")
-    else:
-        dispatch_post(title, body, photo_url, video_url, photos)
-        remember_title(state, title, body)
-        log.info(f"یک پست از {source_label} با موفقیت منتشر شد (اولویت={priority}).")
 
 
 # =========================================================================
-# بخش ۱۲: پردازش یک منبع — ادغام پست‌های پشت‌سرهمِ مرتبط (burst) +
+# بخش ۱۱: پردازش یک کانال — ادغام پست‌های پشت‌سرهمِ مرتبط (burst) +
 #          سیستم تلاش مجدد با سقف (retry-capped) به‌جای گم‌شدن دائمی پست هنگام خطا
 # =========================================================================
 
@@ -960,10 +840,9 @@ def process_posts(state, source_key, posts):
         log.info(f"منبع {source_key} برای اولین‌بار ثبت شد، از پست بعدی پردازش می‌شود.")
         return
 
-    is_website_source = source_key.startswith("web:")
     text_bearing_posts = [p for p in new_posts if p["text"]]
 
-    if not is_website_source and len(text_bearing_posts) >= BURST_MIN_POSTS:
+    if len(text_bearing_posts) >= BURST_MIN_POSTS:
         batch_label = f"دسته‌ی {len(text_bearing_posts)}پستی از {source_key}"
         log.info(f"{batch_label} شناسایی شد؛ به‌جای پردازش تک‌تک، ادغام و جمع‌بندی می‌شود.")
 
@@ -975,7 +854,7 @@ def process_posts(state, source_key, posts):
             items = analyze_and_rewrite(combined_text, text_bearing_posts[0]["source_name"])
             for idx, result in enumerate(items):
                 handle_result_item(
-                    state, result, is_website_source,
+                    state, result,
                     photo_url if idx == 0 else None,
                     video_url if idx == 0 else None,
                     photos if idx == 0 else None,
@@ -1014,7 +893,7 @@ def process_posts(state, source_key, posts):
             items = analyze_and_rewrite(text, post["source_name"])
             for idx, result in enumerate(items):
                 handle_result_item(
-                    state, result, is_website_source,
+                    state, result,
                     post.get("photo") if idx == 0 else None,
                     post.get("video") if idx == 0 else None,
                     post.get("photos") if idx == 0 else None,
@@ -1029,7 +908,7 @@ def process_posts(state, source_key, posts):
 
 
 # =========================================================================
-# بخش ۱۳: پیام‌های زمان‌بندی‌شده + پاک‌سازی نیمه‌شب صف
+# بخش ۱۲: پیام‌های زمان‌بندی‌شده + پاک‌سازی نیمه‌شب صف
 # =========================================================================
 
 def check_scheduled_messages(state):
@@ -1059,7 +938,7 @@ def check_scheduled_messages(state):
 
 
 # =========================================================================
-# بخش ۱۴: حلقه‌ی اصلی برنامه
+# بخش ۱۳: حلقه‌ی اصلی برنامه
 # =========================================================================
 
 def process_once(state):
@@ -1068,18 +947,6 @@ def process_once(state):
         if is_source_in_cooldown(state, source_key):
             continue
         posts = fetch_channel_posts(channel)
-        if posts is None:
-            register_source_failure(state, source_key)
-            continue
-        register_source_success(state, source_key)
-        if posts:
-            process_posts(state, source_key, posts)
-
-    for feed_url in SOURCE_WEBSITES:
-        source_key = f"web:{feed_url}"
-        if is_source_in_cooldown(state, source_key):
-            continue
-        posts = fetch_website_posts(feed_url)
         if posts is None:
             register_source_failure(state, source_key)
             continue
@@ -1096,18 +963,18 @@ def main():
         ("BOT_TOKEN", BOT_TOKEN),
         ("TARGET_CHAT_ID", TARGET_CHAT_ID),
         ("GEMINI_API_KEY یا GEMINI_API_KEYS", "yes" if GEMINI_API_KEYS else ""),
+        ("SOURCE_CHANNELS", "yes" if SOURCE_CHANNELS else ""),
     ] if not val]
-    if not SOURCE_CHANNELS and not SOURCE_WEBSITES:
-        missing.append("SOURCE_CHANNELS یا SOURCE_WEBSITES (حداقل یکی)")
     if missing:
         log.error(f"این متغیرها تنظیم نشده‌اند: {', '.join(missing)}")
         return
 
     state = load_state()
     log.info(
-        f"ربات شروع به کار کرد. کانال‌ها: {SOURCE_CHANNELS} | سایت‌ها: {len(SOURCE_WEBSITES)} فید | "
-        f"تعداد کلید Gemini: {len(GEMINI_API_KEYS)} | مدل: {GEMINI_MODEL} | "
-        f"فاصله‌ی پخش روزانه: {MIN_QUEUE_SPACING_MINUTES} تا {MAX_QUEUE_SPACING_MINUTES} دقیقه | "
+        f"ربات شروع به کار کرد (فقط کانال‌های تلگرام). کانال‌ها: {SOURCE_CHANNELS} | "
+        f"تعداد کلید Gemini: {len(GEMINI_API_KEYS)} | مدل‌ها: {GEMINI_MODELS} | "
+        f"مجموع ترکیب کلید×مدل: {len(_COMBOS)} | "
+        f"فاصله‌ی پخش صف شب: {MIN_QUEUE_SPACING_MINUTES} تا {MAX_QUEUE_SPACING_MINUTES} دقیقه | "
         f"آستانه‌ی ادغام پست انبوه: {BURST_MIN_POSTS} | عکس استوک Pexels: {'فعال' if PEXELS_API_KEY else 'غیرفعال (بدون کلید)'}"
     )
     while True:
