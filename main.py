@@ -7,7 +7,6 @@ from contextlib import suppress
 
 from aiohttp import web
 
-from .admin import Admin
 from .config import settings, validate
 from .db import DB
 from .gemini import GeminiPool
@@ -72,9 +71,6 @@ async def main():
     ingestor = Ingestor(settings, db, tg, gemini)
     publisher = Publisher(settings, db, tg, gemini, media)
     scheduler = Scheduler(settings, db, tg, publisher, media)
-    admin = Admin(settings, db, publisher)
-    admin.install(tg.user)
-
     runner = await health_server()
     tasks = [
         asyncio.create_task(telegram_loop(ingestor), name="telegram-ingest"),

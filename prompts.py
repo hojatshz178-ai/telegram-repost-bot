@@ -47,6 +47,8 @@ Scoring guidance for INTERNAL PRIORITY ONLY:
 - major powers (US, China, Russia, India, UK, France, etc.): boost
 - ordinary defense news: medium
 - clearly unrelated/ad/promotional: reject
+- When several source posts describe the same real-world incident, give them the same event_key so the editorial system can combine them into one concise update.
+- Do not create a new event merely because the wording or source differs.
 Do not make up facts. Treat claims as claims.
 """.strip()
 

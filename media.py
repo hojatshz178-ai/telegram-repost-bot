@@ -30,6 +30,12 @@ class MediaManager:
         if self.http:
             await self.http.close()
 
+    @staticmethod
+    def suffix_from_url(url: str) -> str:
+        from urllib.parse import urlparse
+        suffix = Path(urlparse(url).path).suffix.lower()
+        return suffix if suffix in {".jpg", ".jpeg", ".png", ".webp", ".gif", ".mp4", ".mov", ".mkv", ".pdf"} else ".bin"
+
     def file_for(self, url_or_id: str, ext: str) -> Path:
         digest = hashlib.sha256(url_or_id.encode()).hexdigest()[:24]
         return self.settings.media_path / f"{digest}{ext}"
@@ -41,15 +47,23 @@ class MediaManager:
         if path.exists() and path.stat().st_size > 0:
             return path
         try:
-            async with self.http.get(url) as resp:
+            async with self.http.get(url, allow_redirects=True) as resp:
                 if resp.status != 200:
                     return None
-                ct = (resp.headers.get("Content-Type") or "").lower()
-                if "text/html" in ct:
+                ct = (resp.headers.get("Content-Type") or "").split(";", 1)[0].lower()
+                if ct.startswith("text/") or ct == "application/json":
                     return None
                 data = await resp.read()
                 if len(data) < 512:
                     return None
+                if suffix == ".bin":
+                    ext_map = {
+                        "image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp",
+                        "image/gif": ".gif", "video/mp4": ".mp4", "video/webm": ".webm",
+                        "application/pdf": ".pdf",
+                    }
+                    real_suffix = ext_map.get(ct, ".bin")
+                    path = self.file_for(url, real_suffix)
                 path.write_bytes(data)
                 return path
         except (aiohttp.ClientError, asyncio.TimeoutError, OSError):

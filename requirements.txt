@@ -5,5 +5,4 @@ httpx>=0.28,<1
 Pillow>=11,<12
 python-dateutil>=2.9,<3
 rapidfuzz>=3.13,<4
-Telethon>=1.45,<2
 python-dotenv>=1.1,<2
