@@ -63,6 +63,7 @@ def split_csv(value):
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 TARGET_CHAT_ID = os.environ.get("TARGET_CHAT_ID", "").strip()
+TEST_MODE = os.environ.get("TEST_MODE", "false").strip().lower() in {"1", "true", "yes", "on"}
 
 SOURCE_CHANNELS = [
     x.lstrip("@").strip()
@@ -92,9 +93,12 @@ DEDUP_SIMILARITY_THRESHOLD = min(
     max(0.72, env_float("DEDUP_SIMILARITY_THRESHOLD", 0.82)),
 )
 
-# صف انتشار: پایه 60، با حجم بالا حداکثر تا 30 دقیقه پایین می‌آید و هرگز کمتر نمی‌شود.
-MAX_QUEUE_SPACING_MINUTES = 60
-MIN_QUEUE_SPACING_MINUTES = 30
+# زمان‌بندی ثابت انتشار نسخه 3.5:
+# 08:00 تا قبل از 14:00 -> هر 60 دقیقه
+# 14:00 تا قبل از 24:00 -> هر 45 دقیقه
+# حجم صف هیچ‌وقت فاصله انتشار را کاهش نمی‌دهد.
+MORNING_POST_SPACING_MINUTES = 60
+AFTERNOON_POST_SPACING_MINUTES = 45
 
 # گروه‌بندی خبرهای مربوط به یک رویداد.
 EVENT_CLUSTER_WINDOW_MINUTES = max(
@@ -211,6 +215,26 @@ WORLD_VARIETY_TERMS = {
     "taiwan", "تایوان", "korea", "کره", "north korea", "کره شمالی",
 }
 
+
+# سبد محتوایی نسخه 3.5:
+# ایران 40% | جنگ/درگیری خاورمیانه 20% | تحولات خاورمیانه 10%
+# روسیه-اوکراین 10% | نظامی/تسلیحاتی آمریکا-روسیه-چین 20%
+CONTENT_BUCKET_TARGETS = {
+    "iran": 0.40,
+    "middle_east_war": 0.20,
+    "middle_east_developments": 0.10,
+    "russia_ukraine": 0.10,
+    "superpower_military": 0.20,
+}
+CONTENT_BUCKET_WINDOW = 20
+ALLOWED_CONTENT_BUCKETS = set(CONTENT_BUCKET_TARGETS)
+
+SUPERPOWER_ALLOWED_TERMS = {
+    "آمریکا", "ایالات متحده", "usa", "united states", "u.s.",
+    "روسیه", "russia", "moscow", "مسکو",
+    "چین", "china", "beijing", "پکن",
+}
+
 STOPWORDS = {
     "the", "a", "an", "and", "or", "to", "of", "in", "on", "for", "with",
     "from", "at", "by", "is", "are", "was", "were", "be", "as", "that",
@@ -276,7 +300,15 @@ region یکی از این چهار مقدار دقیق باشد:
 - "geopolitics"
 - "routine"
 
-12) priority_hint عددی بین 0 تا 100 بده. این فقط یک راهنمای مدل است و سیستم صف‌بندی خودش دوباره اولویت را محاسبه می‌کند.
+12) content_bucket را دقیقاً یکی از این پنج مقدار قرار بده:
+- "iran" = اخبار مستقیم ایران و حوزه ایران
+- "middle_east_war" = جنگ، حمله، درگیری و عملیات نظامی در خاورمیانه
+- "middle_east_developments" = تحولات سیاسی/امنیتی/دیپلماتیک خاورمیانه که جنگ و درگیری مستقیم نیست
+- "russia_ukraine" = اخبار جنگ و درگیری روسیه و اوکراین
+- "superpower_military" = فقط اخبار نظامی، دفاعی و تسلیحاتی آمریکا، روسیه یا چین که در چهار سبد بالا قرار نمی‌گیرند
+اگر خبر خارج از این پنج سبد است، relevant=false بده و منتشر نکن. اخبار عادی نظامی آلمان، فرانسه، کره و سایر کشورها خارج از این پنج سبد حذف شوند؛ مگر اینکه مستقیماً بخشی از یک رویداد ایران/خاورمیانه/روسیه-اوکراین باشند.
+
+13) priority_hint عددی بین 0 تا 100 بده. این فقط یک راهنمای مدل است و سیستم صف‌بندی خودش دوباره اولویت را محاسبه می‌کند.
 
 13) image_query را به انگلیسی و کوتاه، 3 تا 6 کلمه‌ای بده. باید موضوع عکس را دقیق و غیرخیالی بیان کند. اگر تصویر دقیق رویداد در منبع وجود ندارد، عبارت عمومی موضوعی بده؛ ادعا نکن که تصویر دقیق همان رویداد است.
 
@@ -309,7 +341,11 @@ region یکی از این چهار مقدار دقیق باشد:
 
 22) اگر هیچ ورودی ارزش خبری ندارد، items را خالی برگردان.
 
-23) خروجی فقط JSON معتبر باشد، بدون Markdown و بدون توضیح اضافی.
+23) در انتخاب بین چند خبر ارزشمند، جذابیت خبری برای مخاطب را هم بسنج: شروع درگیری/حمله، تحول مهم، مقام ارشد، تغییر مهم نظامی، خسارت یا اثر راهبردی، و خبر تازه معمولاً جذاب‌تر از خبر روتین هستند. اما برای جذابیت، هیچ واقعیتی را اضافه یا اغراق نکن.
+
+24) اولویت موضوعی کانال این است: ایران، جنگ و درگیری خاورمیانه، تحولات خاورمیانه، جنگ روسیه-اوکراین، سپس نظامی/تسلیحاتی آمریکا/روسیه/چین. در هر batch خبرهای خارج از این محدوده را حذف کن.
+
+25) خروجی فقط JSON معتبر باشد، بدون Markdown و بدون توضیح اضافی.
 
 فرمت:
 {
@@ -322,6 +358,7 @@ region یکی از این چهار مقدار دقیق باشد:
       "body": "...",
       "image_query": "...",
       "post_indices": [1],
+      "content_bucket": "iran|middle_east_war|middle_east_developments|russia_ukraine|superpower_military",
       "region": "iran|middle_east|world|superpower",
       "event_type": "military_event|security|defense|geopolitics|routine",
       "category": "military|security|defense|geopolitics|technology|general",
@@ -444,6 +481,7 @@ def default_state():
         "_last_queue_purge_date": "",
         "_last_posted_region": "",
         "_last_posted_regions": [],
+        "_last_posted_buckets": [],
         "_gemini_keys": {},
     }
 
@@ -472,6 +510,8 @@ def load_state():
             base["_recent_inputs"] = []
         if not isinstance(base.get("_last_posted_regions"), list):
             base["_last_posted_regions"] = []
+        if not isinstance(base.get("_last_posted_buckets"), list):
+            base["_last_posted_buckets"] = []
 
         return base
     except Exception as exc:
@@ -706,6 +746,18 @@ def calculate_priority(item):
 
     score = 0
 
+    bucket = item.get("content_bucket") or infer_content_bucket(text, region)
+    if bucket in {"middle_east_war", "russia_ukraine"}:
+        score += 70
+    elif bucket == "iran":
+        score += 45
+    elif bucket == "middle_east_developments":
+        score += 30
+    elif bucket == "superpower_military":
+        score += 22
+    else:
+        score -= 100
+
     if is_military_event(text, event_type):
         score += 55
 
@@ -760,6 +812,12 @@ def calculate_priority(item):
 def apply_queue_diversity_score(state, item):
     score, region = calculate_priority(item)
     recent_regions = state.get("_last_posted_regions", [])[-3:]
+    bucket = item.get("content_bucket") or infer_content_bucket(
+        f"{item.get('title','')}\n{item.get('body','')}",
+        region
+    )
+    deficit = bucket_deficit(state, bucket)
+    score += int(max(-20, min(35, deficit * 10)))
 
     if recent_regions and region == recent_regions[-1]:
         score -= 10
@@ -887,6 +945,61 @@ def parse_json_response(raw):
     raise ValueError(f"خروجی Gemini JSON نیست: {raw[:500]}")
 
 
+def infer_content_bucket(text, region=""):
+    """طبقه‌بندی محافظه‌کارانه برای کنترل سبد محتوایی نسخه 3.5."""
+    text = normalize_for_match(text)
+
+    if contains_any(text, IRAN_TERMS):
+        return "iran"
+
+    ru_terms = {
+        "روسیه", "russia", "اوکراین", "ukraine",
+        "moscow", "مسکو", "کی‌یف", "کیف", "kyiv"
+    }
+    if contains_any(text, ru_terms) and contains_any(
+        text, MILITARY_EVENT_TERMS | {"ukraine", "اوکراین"}
+    ):
+        return "russia_ukraine"
+
+    if contains_any(text, MIDDLE_EAST_TERMS):
+        if contains_any(text, MILITARY_EVENT_TERMS):
+            return "middle_east_war"
+        return "middle_east_developments"
+
+    military_terms = {
+        "نظامی", "military", "سلاح", "تسلیحات", "weapon",
+        "weapons", "defense", "دفاعی", "جنگنده", "fighter",
+        "تانک", "tank", "پهپاد", "drone", "موشک", "missile",
+        "پدافند", "air defense", "navy", "ارتش"
+    }
+    if contains_any(text, SUPERPOWER_ALLOWED_TERMS) and contains_any(text, military_terms):
+        return "superpower_military"
+
+    return "world"
+
+
+def is_allowed_content_bucket(bucket):
+    return bucket in ALLOWED_CONTENT_BUCKETS
+
+
+def recent_bucket_counts(state):
+    recent = state.get("_last_posted_buckets", [])[-CONTENT_BUCKET_WINDOW:]
+    return {bucket: recent.count(bucket) for bucket in ALLOWED_CONTENT_BUCKETS}
+
+
+def bucket_deficit(state, bucket):
+    recent = state.get("_last_posted_buckets", [])[-CONTENT_BUCKET_WINDOW:]
+    total = len(recent)
+    if total == 0:
+        return CONTENT_BUCKET_TARGETS.get(bucket, 0)
+
+    # برای پست بعدی، تعداد هدف را در یک پنجره حداکثر 20 پستی محاسبه می‌کنیم.
+    target = CONTENT_BUCKET_TARGETS.get(bucket, 0) * min(
+        CONTENT_BUCKET_WINDOW, total + 1
+    )
+    return target - recent.count(bucket)
+
+
 def validate_gemini_items(items):
     if not isinstance(items, list):
         raise ValueError("Gemini items باید list باشد.")
@@ -943,6 +1056,13 @@ def validate_gemini_items(items):
                 "routine": "general",
             }.get(event_type, "general")
 
+        content_bucket = str(raw.get("content_bucket", "")).strip().lower()
+        if content_bucket not in ALLOWED_CONTENT_BUCKETS:
+            content_bucket = infer_content_bucket(
+                f"{title}\n{body}",
+                region=str(raw.get("region", ""))
+            )
+
         verification = str(raw.get("verification", "reported")).strip().lower()
         if verification not in {"reported", "developing", "confirmed", "analysis"}:
             verification = "reported"
@@ -966,6 +1086,7 @@ def validate_gemini_items(items):
                 "body": body[:5000],
                 "image_query": image_query[:180],
                 "post_indices": post_indices,
+                "content_bucket": content_bucket,
                 "region": str(raw.get("region", "world")).strip().lower(),
                 "event_type": event_type,
                 "category": category,
@@ -1510,42 +1631,43 @@ def send_text_to_telegram(text):
                 raise
     return result
 
-def split_media_caption(title, body, footer, max_chars=1024):
-    """کپشن رسانه حداکثر 1024 کاراکتر؛ ادامه متن جدا و footer در انتهای متن می‌آید."""
-    first = normalize_space(title)
-    rest = (body or "").strip()
+def build_media_caption(title, body, max_chars=1024):
+    """
+    نسخه 3.5:
+    متن خبر و رسانه همیشه در همان یک پیام Telegram قرار می‌گیرند.
+    چون caption رسانه سقف 1024 کاراکتر دارد، فقط بخش بدنه خبر
+    در صورت نیاز کوتاه می‌شود؛ پیام متنی دومی ساخته نمی‌شود.
+    """
+    title = normalize_space(title)
+    body = (body or "").strip()
+    footer = FOOTER
 
-    if len(first) > max_chars:
-        first = truncate_text(first, max_chars)
+    # ابتدا برای تیتر فضای کافی نگه می‌داریم.
+    title_room = max(100, max_chars - len(footer) - 20)
+    if len(title) > title_room:
+        title = truncate_text(title, title_room)
 
-    caption = first
-    remaining_body = rest
+    separators = 6  # فاصله‌های بین title/body/footer
+    body_room = max_chars - len(title) - len(footer) - separators
 
-    if remaining_body:
-        room = max_chars - len(caption) - 2
-        if room > 120:
-            body_part = truncate_text(remaining_body, room)
-            caption = f"{caption}\n\n{body_part}" if caption else body_part
-            consumed = len(body_part.rstrip("…"))
-            remaining_body = remaining_body[consumed:].lstrip()
+    if body_room <= 0:
+        return f"{title}\n\n{footer}"[:max_chars]
 
-    # اگر چیزی باقی مانده، footer را در انتهای پیام متنی قرار می‌دهیم.
-    remaining = remaining_body
-    if remaining:
-        remaining = f"{remaining}\n\n{footer}"
-    else:
-        remaining = footer
+    body_part = truncate_text(body, body_room)
+    caption = f"{title}\n\n{body_part}\n\n{footer}"
 
-    return caption[:max_chars], remaining
+    # اگر به دلیل نحوه برش چند کاراکتر اضافه شد، فقط body را کوتاه‌تر می‌کنیم.
+    if len(caption) > max_chars:
+        extra = len(caption) - max_chars
+        body_room = max(1, body_room - extra)
+        body_part = truncate_text(body, body_room)
+        caption = f"{title}\n\n{body_part}\n\n{footer}"
+
+    return caption[:max_chars]
+
 
 def send_photo_to_telegram(title, body, photo_url):
-    caption, remainder = split_media_caption(
-        title,
-        body,
-        FOOTER,
-        max_chars=1024,
-    )
-
+    caption = build_media_caption(title, body, 1024)
     temp_path = None
     try:
         temp_path, _ = stream_download_to_temp(
@@ -1560,7 +1682,7 @@ def send_photo_to_telegram(title, body, photo_url):
                 "sendPhoto",
                 data={
                     "chat_id": TARGET_CHAT_ID,
-                    "caption": caption[:1024],
+                    "caption": caption,
                 },
                 files={
                     "photo": (
@@ -1571,7 +1693,6 @@ def send_photo_to_telegram(title, body, photo_url):
                 },
                 timeout=90,
             )
-
     finally:
         if temp_path and os.path.exists(temp_path):
             try:
@@ -1579,19 +1700,9 @@ def send_photo_to_telegram(title, body, photo_url):
             except OSError:
                 pass
 
-    # اگر متن کامل در caption جا نشده یا برای footer.
-    if remainder:
-        send_text_to_telegram(remainder)
-
 
 def send_video_to_telegram(title, body, video_url):
-    caption, remainder = split_media_caption(
-        title,
-        body,
-        FOOTER,
-        max_chars=1024,
-    )
-
+    caption = build_media_caption(title, body, 1024)
     temp_path = None
     try:
         temp_path, _ = stream_download_to_temp(
@@ -1606,7 +1717,7 @@ def send_video_to_telegram(title, body, video_url):
                 "sendVideo",
                 data={
                     "chat_id": TARGET_CHAT_ID,
-                    "caption": caption[:1024],
+                    "caption": caption,
                     "supports_streaming": "true",
                 },
                 files={
@@ -1618,16 +1729,12 @@ def send_video_to_telegram(title, body, video_url):
                 },
                 timeout=180,
             )
-
     finally:
         if temp_path and os.path.exists(temp_path):
             try:
                 os.unlink(temp_path)
             except OSError:
                 pass
-
-    if remainder:
-        send_text_to_telegram(remainder)
 
 
 def public_category_label(item):
@@ -1880,21 +1987,13 @@ def enqueue_item(state, item):
     return True
 
 
-def compute_dynamic_spacing_minutes(queue_len):
-    """
-    0-3  => 60
-    4-8  => 50
-    9-14 => 40
-    15+  => 30
-    هیچ‌وقت کمتر از 30 نمی‌شود.
-    """
-    if queue_len <= 3:
-        return 60
-    if queue_len <= 8:
-        return 50
-    if queue_len <= 14:
-        return 40
-    return 30
+def compute_publish_spacing_minutes(now_dt):
+    """زمان‌بندی ثابت نسخه 3.5؛ مستقل از حجم صف."""
+    if 8 <= now_dt.hour < 14:
+        return MORNING_POST_SPACING_MINUTES
+    if 14 <= now_dt.hour < 24:
+        return AFTERNOON_POST_SPACING_MINUTES
+    return None
 
 
 def choose_next_queue_item(state):
@@ -1928,6 +2027,12 @@ def mark_posted_region(state, item):
     recent.append(region)
     state["_last_posted_regions"] = recent[-5:]
 
+    bucket = item.get("content_bucket")
+    if bucket:
+        bucket_recent = state.setdefault("_last_posted_buckets", [])
+        bucket_recent.append(bucket)
+        state["_last_posted_buckets"] = bucket_recent[-CONTENT_BUCKET_WINDOW:]
+
 
 def is_quiet_hour(now_dt):
     return QUIET_START_HOUR <= now_dt.hour < QUIET_END_HOUR
@@ -1942,9 +2047,11 @@ def process_queue(state):
     if is_quiet_hour(now_dt):
         return
 
-    spacing = compute_dynamic_spacing_minutes(len(queue))
-    last_release = state.get("_last_queue_release_ts", 0)
+    spacing = compute_publish_spacing_minutes(now_dt)
+    if spacing is None:
+        return
 
+    last_release = state.get("_last_queue_release_ts", 0)
     if last_release:
         elapsed_minutes = (now_ts() - last_release) / 60.0
         if elapsed_minutes < spacing:
@@ -2077,6 +2184,9 @@ def process_cluster(state, source_key, cluster):
             "urgent": safe_bool(result.get("urgent")),
             "important": safe_bool(result.get("important")),
             "region": region,
+            "content_bucket": result.get("content_bucket") or infer_content_bucket(
+                f"{title}\n{body}", region
+            ),
             "event_type": result.get("event_type", "routine"),
             "category": result.get("category", "general"),
             "verification": result.get("verification", "reported"),
@@ -2088,6 +2198,11 @@ def process_cluster(state, source_key, cluster):
             "video": result_video or video_url,
             "queued_at": now_ts(),
         }
+
+        if not is_allowed_content_bucket(item["content_bucket"]):
+            log.info("خبر خارج از سبد محتوایی نسخه 3.5 حذف شد: %s", title)
+            successful_interpretation = True
+            continue
 
         # اگر عکس منبع وجود ندارد، fallback واقعی انجام می‌شود.
         if not item["photo"] and not item["video"]:
@@ -2404,10 +2519,154 @@ def validate_config():
 
 
 # ============================================================
+# Safe TEST MODE / diagnostics
+# ============================================================
+
+def test_gemini_connection():
+    """فقط یک درخواست بسیار کوچک برای تست کلید اول Gemini؛ هیچ خبر واقعی ارسال نمی‌شود."""
+    if not GEMINI_API_KEYS:
+        raise RuntimeError("GEMINI_API_KEYS تنظیم نشده است.")
+
+    key = GEMINI_API_KEYS[0]
+    payload = {
+        "contents": [
+            {
+                "parts": [
+                    {"text": "Reply with exactly: RAPTOR_TEST_OK"}
+                ]
+            }
+        ],
+        "generationConfig": {
+            "temperature": 0,
+            "maxOutputTokens": 8,
+        },
+    }
+    response = requests.post(
+        f"{GEMINI_API_URL}?key={key}",
+        json=payload,
+        timeout=30,
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        data = response.json()
+    except ValueError:
+        data = {}
+    if not response.ok:
+        message = data.get("error", {}).get("message") or response.text[:300]
+        raise RuntimeError(f"Gemini تست نشد: HTTP {response.status_code} - {message}")
+    text = ""
+    try:
+        text = data["candidates"][0]["content"]["parts"][0].get("text", "")
+    except (KeyError, IndexError, TypeError):
+        pass
+    return bool(text.strip()), text.strip()
+
+
+def test_telegram_connection():
+    """تست امن Telegram: فقط getMe و getChat؛ هیچ پیام/مدیایی ارسال نمی‌شود."""
+    if not BOT_TOKEN:
+        raise RuntimeError("BOT_TOKEN تنظیم نشده است.")
+
+    base = f"https://api.telegram.org/bot{BOT_TOKEN}"
+    me = requests.get(f"{base}/getMe", timeout=20)
+    try:
+        me_data = me.json()
+    except ValueError:
+        me_data = {}
+    if not me.ok or not me_data.get("ok"):
+        raise RuntimeError(
+            "BOT_TOKEN معتبر نیست یا Telegram پاسخ معتبر نداد: "
+            + str(me_data.get("description") or me.text[:300])
+        )
+
+    target = requests.get(
+        f"{base}/getChat",
+        params={"chat_id": TARGET_CHAT_ID},
+        timeout=20,
+    )
+    try:
+        target_data = target.json()
+    except ValueError:
+        target_data = {}
+    if not target.ok or not target_data.get("ok"):
+        raise RuntimeError(
+            "TARGET_CHAT_ID قابل دسترسی نیست: "
+            + str(target_data.get("description") or target.text[:300])
+        )
+
+    return me_data.get("result", {}), target_data.get("result", {})
+
+
+def test_sources_connection():
+    """تست خواندن عمومی کانال‌ها؛ فقط GET و بدون ارسال یا تغییر داده در Telegram."""
+    results = []
+    for channel in SOURCE_CHANNELS:
+        url = f"https://t.me/s/{channel}"
+        try:
+            response = requests.get(url, timeout=(10, 30), headers=HTTP_HEADERS)
+            response.raise_for_status()
+            posts = extract_telegram_posts_from_html(channel, response.text)
+            results.append((channel, True, len(posts), "OK"))
+        except Exception as exc:
+            results.append((channel, False, 0, str(exc)[:180]))
+    return results
+
+
+def run_safe_test_mode():
+    """اجرای تست کامل و سپس خروج؛ TEST_MODE هرگز dispatch_item/process_queue را اجرا نمی‌کند."""
+    print("=" * 60)
+    print("Raptor News Bot v3.5 — SAFE TEST MODE")
+    print("هیچ پست، عکس یا ویدیویی به Telegram ارسال نخواهد شد.")
+    print("=" * 60)
+
+    validate_config()
+    print(f"[PASS] Variables پایه: {len(SOURCE_CHANNELS)} source و {len(GEMINI_API_KEYS)} Gemini key")
+    print(f"[PASS] Gemini model: {GEMINI_MODEL}")
+    print(f"[PASS] Schedule: 08-14 هر {MORNING_POST_SPACING_MINUTES} دقیقه | 14-24 هر {AFTERNOON_POST_SPACING_MINUTES} دقیقه")
+    print("[PASS] TEST_MODE فعال است؛ مسیر انتشار غیرفعال است.")
+
+    # Telegram: فقط خواندن اطلاعات ربات/کانال
+    me, target = test_telegram_connection()
+    print(f"[PASS] Telegram BOT_TOKEN: @{me.get('username') or me.get('first_name', 'unknown')}")
+    print(f"[PASS] TARGET_CHAT_ID: {target.get('title') or target.get('username') or target.get('id')}")
+
+    # Source channels
+    source_results = test_sources_connection()
+    for channel, ok, count, detail in source_results:
+        if ok:
+            print(f"[PASS] Source @{channel}: {count} post قابل خواندن")
+        else:
+            print(f"[FAIL] Source @{channel}: {detail}")
+    if not all(row[1] for row in source_results):
+        raise RuntimeError("حداقل یک source channel قابل خواندن نیست.")
+
+    # Gemini: فقط یک درخواست کوچک با کلید اول
+    gemini_ok, gemini_text = test_gemini_connection()
+    if not gemini_ok:
+        raise RuntimeError("Gemini پاسخ متنی معتبر برنگرداند.")
+    print(f"[PASS] Gemini API: {gemini_text[:80]}")
+
+    # ساخت caption واقعی بدون ارسال
+    sample = {
+        "title": "تست تیتر خبر رپتور",
+        "body": "این فقط یک تست داخلی است و به کانال ارسال نمی‌شود.",
+        "verification": "reported",
+        "category": "military",
+    }
+    caption = build_media_caption(format_public_title(sample), format_public_body(sample), 1024)
+    print(f"[PASS] Media caption: {len(caption)} کاراکتر، حداکثر مجاز 1024")
+    print("[PASS] پایان تست؛ هیچ پیام/عکس/ویدیویی ارسال نشد.")
+    print("=" * 60)
+
+# ============================================================
 # Main
 # ============================================================
 
 def main():
+    if TEST_MODE:
+        run_safe_test_mode()
+        return
+
     validate_config()
 
     state = load_state()
@@ -2415,11 +2674,11 @@ def main():
     save_state(state)
 
     log.info("==============================================")
-    log.info("Raptor News Bot v3 (Level 1-3) شروع شد")
+    log.info("Raptor News Bot v3.5 شروع شد")
     log.info("Telegram sources: %s", len(SOURCE_CHANNELS))
     log.info("Gemini keys: %s", len(GEMINI_API_KEYS))
     log.info("Gemini model: %s", GEMINI_MODEL)
-    log.info("Queue spacing: 60 -> 30 minutes")
+    log.info("Publish spacing: 08-14=%s دقیقه | 14-24=%s دقیقه", MORNING_POST_SPACING_MINUTES, AFTERNOON_POST_SPACING_MINUTES)
     log.info("Event cluster max inputs: %s", EVENT_MAX_ITEMS_PER_CLUSTER)
     log.info("Event cluster max outputs: %s", EVENT_MAX_OUTPUT_ITEMS)
     log.info("Gemini batch max posts: %s", GEMINI_BATCH_MAX_POSTS)
