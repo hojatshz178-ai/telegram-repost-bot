@@ -69,8 +69,6 @@ SOURCE_CHANNELS = [
     for x in split_csv(os.environ.get("SOURCE_CHANNELS", ""))
 ]
 
-SOURCE_WEBSITES = []  # وب‌سایت/RSS عمداً حذف شده است؛ فقط کانال‌های تلگرام منبع هستند.
-
 # هر تعداد کلید را قبول می‌کند؛ برای تنظیم فعلی کاربر 14 کلید را در همین متغیر قرار بده.
 _raw_gemini_keys = (
     os.environ.get("GEMINI_API_KEYS")
@@ -106,8 +104,14 @@ EVENT_MAX_ITEMS_PER_CLUSTER = max(
     2, min(10, env_int("EVENT_MAX_ITEMS_PER_CLUSTER", 6))
 )
 EVENT_MAX_OUTPUT_ITEMS = max(
-    1, min(2, env_int("EVENT_MAX_OUTPUT_ITEMS", 2))
+    1, min(6, env_int("EVENT_MAX_OUTPUT_ITEMS", 6))
 )
+
+# کاهش مصرف Gemini: چند پست/رویداد مستقل در یک درخواست بررسی می‌شوند.
+GEMINI_BATCH_MAX_POSTS = max(2, min(10, env_int("GEMINI_BATCH_MAX_POSTS", 6)))
+GEMINI_INPUT_MAX_CHARS_PER_POST = max(800, min(3500, env_int("GEMINI_INPUT_MAX_CHARS_PER_POST", 2200)))
+GEMINI_RECENT_INPUT_WINDOW_MINUTES = max(60, env_int("GEMINI_RECENT_INPUT_WINDOW_MINUTES", 720))
+GEMINI_LOCAL_DUP_THRESHOLD = min(0.96, max(0.80, env_float("GEMINI_LOCAL_DUP_THRESHOLD", 0.88)))
 
 # فقط برای ساعت سکوت؛ خبرهای عادی در صف می‌روند.
 MORNING_HOUR = 8
@@ -127,7 +131,7 @@ MAX_VIDEO_BYTES = max(
 DEFAULT_STATE_FILE = "/data/state.json" if os.path.isdir("/data") else "state.json"
 STATE_FILE = os.environ.get("STATE_FILE", DEFAULT_STATE_FILE)
 
-# User-Agent ثابت برای RSS / صفحات عمومی.
+# User-Agent ثابت برای صفحات عمومی و منابع تلگرامی.
 HTTP_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (compatible; RaptorNewsBot/2.0; "
@@ -279,7 +283,33 @@ region یکی از این چهار مقدار دقیق باشد:
 14) source_note یک جمله کوتاه باشد که وضعیت منبع را روشن کند؛ مثال:
 «این خبر بر اساس گزارش اولیه منبع است و هنوز به‌طور مستقل تأیید نشده است.»
 
-15) خروجی فقط JSON معتبر باشد، بدون Markdown و بدون توضیح اضافی.
+15) category یکی از این مقادیر دقیق باشد:
+- "military"
+- "security"
+- "defense"
+- "geopolitics"
+- "technology"
+- "general"
+
+16) verification یکی از این مقادیر دقیق باشد:
+- "reported" = گزارش اولیه/ادعا، بدون تأیید مستقل
+- "developing" = خبر در حال تکمیل و جزئیات هنوز در حال تغییر
+- "confirmed" = متن ورودی صراحتاً به تأیید معتبر اشاره دارد
+- "analysis" = تحلیل یا ارزیابی، نه یک ادعای قطعی خبری
+
+17) اگر ورودی‌ها تکراری یا کم‌ارزش‌اند، relevant=false بده و منتشر نکن. تبلیغات، دعوت به عضویت، متن‌های صرفاً تکراری، کپشن‌های بی‌محتوا و پست‌های بدون ارزش خبری حذف شوند.
+
+18) اگر چند منبع درباره یک اتفاق مشترک هستند، یک خبر واحد و منسجم بساز و اختلاف روایت‌ها را با عبارت‌هایی مثل «بر اساس گزارش‌ها» یا «روایت‌های موجود متفاوت است» روشن کن. نام یا لینک منبع را در متن خروجی ننویس.
+
+19) تیتر باید خبری و حرفه‌ای باشد؛ از کلیک‌بیت، اغراق، علامت تعجب‌های متعدد و ادعاهای قطعی بدون پشتوانه پرهیز کن.
+
+20) ممکن است این batch شامل چند رویداد مستقل باشد. برای هر رویداد مستقل ارزشمند حداکثر یک خروجی بده و رویداد ارزشمند را صرفاً به دلیل قرار گرفتن کنار رویداد دیگر حذف نکن.
+
+21) برای هر خروجی، post_indices را با شماره پست‌های ورودی که آن خروجی بر اساس آن‌ها ساخته شده مشخص کن؛ اگر چند پست یک رویداد هستند، همه شماره‌های مرتبط را بده.
+
+22) اگر هیچ ورودی ارزش خبری ندارد، items را خالی برگردان.
+
+23) خروجی فقط JSON معتبر باشد، بدون Markdown و بدون توضیح اضافی.
 
 فرمت:
 {
@@ -291,8 +321,11 @@ region یکی از این چهار مقدار دقیق باشد:
       "title": "...",
       "body": "...",
       "image_query": "...",
+      "post_indices": [1],
       "region": "iran|middle_east|world|superpower",
       "event_type": "military_event|security|defense|geopolitics|routine",
+      "category": "military|security|defense|geopolitics|technology|general",
+      "verification": "reported|developing|confirmed|analysis",
       "priority_hint": 0,
       "source_note": "..."
     }
@@ -403,6 +436,7 @@ def default_state():
         "_source_initialized": {},
         "_recent_titles": [],
         "_recent_events": [],
+        "_recent_inputs": [],
         "_pending_queue": [],
         "_last_queue_release_ts": 0,
         "_last_morning_date": "",
@@ -434,6 +468,8 @@ def load_state():
             base["_recent_titles"] = []
         if not isinstance(base.get("_recent_events"), list):
             base["_recent_events"] = []
+        if not isinstance(base.get("_recent_inputs"), list):
+            base["_recent_inputs"] = []
         if not isinstance(base.get("_last_posted_regions"), list):
             base["_last_posted_regions"] = []
 
@@ -871,6 +907,7 @@ def validate_gemini_items(items):
                     "title": "",
                     "body": "",
                     "image_query": "",
+                    "post_indices": [],
                     "region": "world",
                     "event_type": "routine",
                     "priority_hint": 0,
@@ -893,6 +930,33 @@ def validate_gemini_items(items):
         if event_type not in allowed_event_types:
             event_type = "routine"
 
+        category = str(raw.get("category", "")).strip().lower()
+        allowed_categories = {
+            "military", "security", "defense", "geopolitics", "technology", "general"
+        }
+        if category not in allowed_categories:
+            category = {
+                "military_event": "military",
+                "security": "security",
+                "defense": "defense",
+                "geopolitics": "geopolitics",
+                "routine": "general",
+            }.get(event_type, "general")
+
+        verification = str(raw.get("verification", "reported")).strip().lower()
+        if verification not in {"reported", "developing", "confirmed", "analysis"}:
+            verification = "reported"
+
+        raw_indices = raw.get("post_indices", [])
+        if not isinstance(raw_indices, list):
+            raw_indices = []
+        post_indices = []
+        for value in raw_indices:
+            idx = safe_int(value, 0)
+            if idx > 0 and idx not in post_indices:
+                post_indices.append(idx)
+        post_indices = post_indices[:GEMINI_BATCH_MAX_POSTS]
+
         validated.append(
             {
                 "relevant": True,
@@ -901,8 +965,11 @@ def validate_gemini_items(items):
                 "title": title[:220],
                 "body": body[:5000],
                 "image_query": image_query[:180],
+                "post_indices": post_indices,
                 "region": str(raw.get("region", "world")).strip().lower(),
                 "event_type": event_type,
+                "category": category,
+                "verification": verification,
                 "priority_hint": min(100, max(0, safe_int(raw.get("priority_hint"), 0))),
                 "source_note": normalize_space(str(raw.get("source_note", "")))[:500],
             }
@@ -926,13 +993,11 @@ def analyze_and_rewrite(batch_posts, source_name):
     source_chunks = []
     for index, post in enumerate(batch_posts, start=1):
         published = post.get("published_at", "")
-        source_url = post.get("source_url", "")
-        text = post.get("text", "")
+        text = truncate_text(post.get("text", ""), GEMINI_INPUT_MAX_CHARS_PER_POST)
 
         source_chunks.append(
             f"[پست {index}]\n"
             f"زمان: {published}\n"
-            f"لینک: {source_url}\n"
             f"متن:\n{text}\n"
         )
 
@@ -1087,6 +1152,38 @@ def analyze_and_rewrite_safe(state, batch_posts, source_name):
 # Telegram public channel scraping
 # ============================================================
 
+NOISE_PATTERNS = (
+    "join our channel",
+    "subscribe to our channel",
+    "подписывайтесь",
+    "подписаться",
+    "عضو شوید",
+    "به کانال ما بپیوندید",
+    "تبلیغات",
+)
+
+
+def looks_like_low_value_post(post):
+    text = normalize_space(post.get("text", ""))
+    if not text and not post.get("photo") and not post.get("video"):
+        return True
+    if len(text) < 12 and not post.get("photo") and not post.get("video"):
+        return True
+
+    lowered = normalize_for_match(text)
+    if any(normalize_for_match(pattern) in lowered for pattern in NOISE_PATTERNS):
+        if not contains_any(text, MILITARY_EVENT_TERMS | BREAKING_TERMS):
+            return True
+
+    if text and re.fullmatch(r"(https?://\S+|@\w+)(\s+https?://\S+|\s+@\w+)*", text):
+        return True
+    return False
+
+
+def filter_posts(posts):
+    return [post for post in posts if not looks_like_low_value_post(post)]
+
+
 def extract_telegram_posts_from_html(channel, html_text):
     if BeautifulSoup is None:
         raise RuntimeError("beautifulsoup4 نصب نیست.")
@@ -1143,6 +1240,7 @@ def extract_telegram_posts_from_html(channel, html_text):
             posts.append(
                 {
                     "uid": f"tg:{channel}:{message_id}",
+                    "_source_key": f"tg:{channel}",
                     "text": text,
                     "title": text.split("\n", 1)[0][:220] if text else "",
                     "photo": photo_url,
@@ -1153,7 +1251,7 @@ def extract_telegram_posts_from_html(channel, html_text):
                 }
             )
 
-    return posts
+    return filter_posts(posts)
 
 
 def fetch_channel_posts(channel):
@@ -1532,10 +1630,43 @@ def send_video_to_telegram(title, body, video_url):
         send_text_to_telegram(remainder)
 
 
+def public_category_label(item):
+    labels = {
+        "military": "🛡️ نظامی",
+        "security": "🔐 امنیتی",
+        "defense": "🛰️ دفاعی",
+        "geopolitics": "🌍 ژئوپلیتیک",
+        "technology": "💻 فناوری",
+        "general": "📰 خبر",
+    }
+    return labels.get(item.get("category", "general"), labels["general"])
+
+
+def public_verification_label(item):
+    labels = {
+        "reported": "⚠️ گزارش اولیه",
+        "developing": "🔄 خبر در حال تکمیل",
+        "confirmed": "✅ تأییدشده در متن گزارش",
+        "analysis": "📊 تحلیل",
+    }
+    return labels.get(item.get("verification", "reported"), labels["reported"])
+
+
+def format_public_title(item):
+    title = normalize_space(item.get("title", ""))
+    return f"{public_category_label(item)} | {title}" if title else ""
+
+
+def format_public_body(item):
+    body = (item.get("body", "") or "").strip()
+    status = public_verification_label(item)
+    return f"{status}\n\n{body}" if body else status
+
+
 def build_text_only_message(item):
     # لینک/نام منبع عمداً در پست نهایی نمایش داده نمی‌شود.
-    title = normalize_space(item.get("title", ""))
-    body = (item.get("body", "") or "").strip()
+    title = format_public_title(item)
+    body = format_public_body(item)
 
     parts = []
     if title:
@@ -1548,8 +1679,8 @@ def build_text_only_message(item):
 
 
 def dispatch_item(item):
-    title = normalize_space(item.get("title", ""))
-    body = (item.get("body", "") or "").strip()
+    title = format_public_title(item)
+    body = format_public_body(item)
     photo = item.get("photo")
     video = item.get("video")
 
@@ -1594,6 +1725,55 @@ def purge_recent_memories(state):
         x for x in state.get("_recent_events", [])
         if x.get("ts", 0) >= cutoff
     ][-400:]
+
+
+def purge_recent_inputs(state):
+    cutoff = now_ts() - GEMINI_RECENT_INPUT_WINDOW_MINUTES * 60
+    state["_recent_inputs"] = [
+        x for x in state.get("_recent_inputs", [])
+        if x.get("ts", 0) >= cutoff
+    ][-600:]
+
+
+def is_input_duplicate(state, post):
+    """
+    حذف تکراری‌های خام قبل از Gemini. این مرحله عمداً محافظه‌کار است تا
+    فقط پست‌هایی را حذف کند که شباهت بالایی با ورودی اخیراً پردازش‌شده دارند.
+    """
+    purge_recent_inputs(state)
+    text = normalize_space(post.get("text", ""))
+    if len(text) < 40:
+        return False
+
+    for recent in state.get("_recent_inputs", []):
+        old_text = recent.get("text", "")
+        if not old_text:
+            continue
+        sim = combined_similarity(text, "", old_text, "")
+        if sim >= GEMINI_LOCAL_DUP_THRESHOLD:
+            return True
+
+        current_tokens = tokens(text)
+        old_tokens = set(recent.get("tokens", []))
+        if current_tokens and old_tokens:
+            overlap = len(current_tokens & old_tokens) / max(1, len(current_tokens | old_tokens))
+            if overlap >= 0.62:
+                return True
+    return False
+
+
+def remember_input_posts(state, posts):
+    purge_recent_inputs(state)
+    for post in posts:
+        text = normalize_space(post.get("text", ""))
+        if len(text) < 20:
+            continue
+        state["_recent_inputs"].append({
+            "text": text[:3000],
+            "tokens": list(tokens(text))[:100],
+            "ts": now_ts(),
+        })
+    state["_recent_inputs"] = state["_recent_inputs"][-600:]
 
 
 def is_duplicate(state, title, body):
@@ -1695,7 +1875,7 @@ def enqueue_item(state, item):
     )
 
     # حداکثر اندازه صف.
-    state["_pending_queue"] = queue[-500:]
+    state["_pending_queue"] = queue[:500]
     save_state(state)
     return True
 
@@ -1841,7 +2021,12 @@ def process_cluster(state, source_key, cluster):
     if not cluster:
         return
 
-    source_name = cluster[0].get("source_name", source_key)
+    source_names = sorted({
+        p.get("source_name", source_key)
+        for p in cluster
+        if p.get("source_name")
+    })
+    source_name = "، ".join(source_names) if source_names else source_key
 
     # Gemini فقط با batchهای مرتبط کار می‌کند؛ حتی اگر یک پست باشد.
     items = analyze_and_rewrite_safe(
@@ -1861,6 +2046,13 @@ def process_cluster(state, source_key, cluster):
         if not result.get("relevant"):
             successful_interpretation = True
             continue
+
+        linked_indices = [
+            idx for idx in result.get("post_indices", [])
+            if 1 <= safe_int(idx, 0) <= len(cluster)
+        ]
+        linked_posts = [cluster[idx - 1] for idx in linked_indices] if linked_indices else cluster
+        result_photo, result_video, result_source_url, result_source_urls = combine_original_media(linked_posts)
 
         title = normalize_space(result.get("title", ""))
         body = (result.get("body", "") or "").strip()
@@ -1886,12 +2078,14 @@ def process_cluster(state, source_key, cluster):
             "important": safe_bool(result.get("important")),
             "region": region,
             "event_type": result.get("event_type", "routine"),
+            "category": result.get("category", "general"),
+            "verification": result.get("verification", "reported"),
             "priority_hint": safe_int(result.get("priority_hint"), 0),
             "source_note": result.get("source_note", ""),
-            "source_url": first_source_url,
-            "source_urls": source_urls[:10],
-            "photo": photo_url,
-            "video": video_url,
+            "source_url": result_source_url or first_source_url,
+            "source_urls": (result_source_urls or source_urls)[:10],
+            "photo": result_photo or photo_url,
+            "video": result_video or video_url,
             "queued_at": now_ts(),
         }
 
@@ -1899,7 +2093,7 @@ def process_cluster(state, source_key, cluster):
         if not item["photo"] and not item["video"]:
             item["photo"] = choose_image_url(
                 item,
-                cluster,
+                linked_posts,
             )
 
         apply_queue_diversity_score(state, item)
@@ -2039,24 +2233,130 @@ def check_scheduled_messages(state):
 # Polling
 # ============================================================
 
+def build_gemini_batches(clusters):
+    """
+    خوشه‌های رویدادی را بدون شکستن آن‌ها در batchهای کوچک‌تر جمع می‌کند تا
+    چند خبر مستقل با یک درخواست Gemini بررسی شوند.
+    """
+    batches = []
+    current = []
+    current_size = 0
+
+    for cluster in clusters:
+        if not cluster:
+            continue
+        cluster_size = len(cluster)
+
+        if current and current_size + cluster_size > GEMINI_BATCH_MAX_POSTS:
+            batches.append(current)
+            current = []
+            current_size = 0
+
+        # یک خوشه بزرگ را به قطعات جدا تقسیم می‌کنیم؛ حالت معمول نیست.
+        if cluster_size > GEMINI_BATCH_MAX_POSTS:
+            for start in range(0, cluster_size, GEMINI_BATCH_MAX_POSTS):
+                part = cluster[start:start + GEMINI_BATCH_MAX_POSTS]
+                if current:
+                    batches.append(current)
+                    current = []
+                    current_size = 0
+                batches.append(part)
+            continue
+
+        current.extend(cluster)
+        current_size += cluster_size
+
+    if current:
+        batches.append(current)
+    return batches
+
+
 def process_once(state):
-    all_sources = []
+    """
+    چرخه پردازش سطح 1 تا 3:
+    - جمع‌آوری از همه کانال‌های تلگرام
+    - حذف نویزهای واضح
+    - خوشه‌بندی مشترک بین منابع برای ادغام یک رویداد
+    - بازنویسی/فیلتر با Gemini
+    - صف‌بندی و انتشار با قالب حرفه‌ای
+    """
+    all_new_posts = []
 
     for channel in SOURCE_CHANNELS:
+        source_key = f"tg:{channel}"
         posts = fetch_channel_posts(channel)
-        if posts:
-            all_sources.append(
-                (f"tg:{channel}", posts)
-            )
+        if not posts:
+            continue
 
-    # هر منبع ابتدا جداگانه گروه‌بندی می‌شود تا زنجیره پست‌های همان منبع
-    # بهتر جمع‌بندی شود.
-    for source_key, posts in all_sources:
-        process_source(
-            state,
-            source_key,
-            posts,
-        )
+        processed = set(state.get(source_key, []))
+
+        if not state.get("_source_initialized", {}).get(source_key):
+            state.setdefault("_source_initialized", {})[source_key] = True
+            state[source_key] = [p["uid"] for p in posts[-500:]]
+            save_state(state)
+            log.info(
+                "منبع %s برای اولین بار ثبت شد؛ پست‌های موجود قدیمی پردازش نشدند.",
+                source_key,
+            )
+            continue
+
+        new_posts = [p for p in posts if p.get("uid") not in processed]
+        for post in new_posts:
+            post["_source_key"] = source_key
+        all_new_posts.extend(new_posts)
+
+    if all_new_posts:
+        # تکراری‌های خامی که قبلاً در چند منبع دیده و پردازش شده‌اند، قبل از Gemini حذف می‌شوند.
+        filtered_new_posts = []
+        locally_skipped = 0
+        for post in all_new_posts:
+            if is_input_duplicate(state, post):
+                locally_skipped += 1
+                source_key = post.get("_source_key")
+                uid = post.get("uid")
+                if source_key and uid:
+                    current = state.setdefault(source_key, [])
+                    if uid not in current:
+                        current.append(uid)
+                    state[source_key] = current[-500:]
+                continue
+            filtered_new_posts.append(post)
+
+        if locally_skipped:
+            log.info("%s پست تکراری قبل از Gemini حذف شد.", locally_skipped)
+
+        clusters = cluster_posts(filtered_new_posts)
+        gemini_batches = build_gemini_batches(clusters)
+        log.info("%s پست جدید -> %s cluster -> %s درخواست احتمالی Gemini", len(all_new_posts), len(clusters), len(gemini_batches))
+
+        for cluster in gemini_batches:
+            try:
+                process_cluster(state, "multi-source", cluster)
+                remember_input_posts(state, cluster)
+
+                # فقط بعد از موفقیت کامل، UIDهای همان منابع ثبت می‌شوند.
+                for post in cluster:
+                    source_key = post.get("_source_key")
+                    uid = post.get("uid")
+                    if not source_key or not uid:
+                        continue
+                    current = state.setdefault(source_key, [])
+                    if uid not in current:
+                        current.append(uid)
+                    state[source_key] = current[-500:]
+
+                save_state(state)
+                log.info(
+                    "cluster چندمنبعی با %s پست پردازش شد؛ sources=%s",
+                    len(cluster),
+                    len({p.get("_source_key") for p in cluster}),
+                )
+
+            except Exception as exc:
+                log.error(
+                    "cluster شکست خورد و UIDهای آن mark نشدند؛ error=%s",
+                    exc,
+                )
 
     check_scheduled_messages(state)
     process_queue(state)
@@ -2115,13 +2415,15 @@ def main():
     save_state(state)
 
     log.info("==============================================")
-    log.info("Raptor News Bot v2 شروع شد")
+    log.info("Raptor News Bot v3 (Level 1-3) شروع شد")
     log.info("Telegram sources: %s", len(SOURCE_CHANNELS))
     log.info("Gemini keys: %s", len(GEMINI_API_KEYS))
     log.info("Gemini model: %s", GEMINI_MODEL)
     log.info("Queue spacing: 60 -> 30 minutes")
     log.info("Event cluster max inputs: %s", EVENT_MAX_ITEMS_PER_CLUSTER)
     log.info("Event cluster max outputs: %s", EVENT_MAX_OUTPUT_ITEMS)
+    log.info("Gemini batch max posts: %s", GEMINI_BATCH_MAX_POSTS)
+    log.info("Gemini local duplicate threshold: %.2f", GEMINI_LOCAL_DUP_THRESHOLD)
     log.info("State file: %s", STATE_FILE)
     log.info("==============================================")
 
