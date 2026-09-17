@@ -63,7 +63,6 @@ def split_csv(value):
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 TARGET_CHAT_ID = os.environ.get("TARGET_CHAT_ID", "").strip()
-TEST_MODE = os.environ.get("TEST_MODE", "false").strip().lower() in {"1", "true", "yes", "on"}
 
 SOURCE_CHANNELS = [
     x.lstrip("@").strip()
@@ -2519,154 +2518,10 @@ def validate_config():
 
 
 # ============================================================
-# Safe TEST MODE / diagnostics
-# ============================================================
-
-def test_gemini_connection():
-    """فقط یک درخواست بسیار کوچک برای تست کلید اول Gemini؛ هیچ خبر واقعی ارسال نمی‌شود."""
-    if not GEMINI_API_KEYS:
-        raise RuntimeError("GEMINI_API_KEYS تنظیم نشده است.")
-
-    key = GEMINI_API_KEYS[0]
-    payload = {
-        "contents": [
-            {
-                "parts": [
-                    {"text": "Reply with exactly: RAPTOR_TEST_OK"}
-                ]
-            }
-        ],
-        "generationConfig": {
-            "temperature": 0,
-            "maxOutputTokens": 8,
-        },
-    }
-    response = requests.post(
-        f"{GEMINI_API_URL}?key={key}",
-        json=payload,
-        timeout=30,
-        headers={"Content-Type": "application/json"},
-    )
-    try:
-        data = response.json()
-    except ValueError:
-        data = {}
-    if not response.ok:
-        message = data.get("error", {}).get("message") or response.text[:300]
-        raise RuntimeError(f"Gemini تست نشد: HTTP {response.status_code} - {message}")
-    text = ""
-    try:
-        text = data["candidates"][0]["content"]["parts"][0].get("text", "")
-    except (KeyError, IndexError, TypeError):
-        pass
-    return bool(text.strip()), text.strip()
-
-
-def test_telegram_connection():
-    """تست امن Telegram: فقط getMe و getChat؛ هیچ پیام/مدیایی ارسال نمی‌شود."""
-    if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN تنظیم نشده است.")
-
-    base = f"https://api.telegram.org/bot{BOT_TOKEN}"
-    me = requests.get(f"{base}/getMe", timeout=20)
-    try:
-        me_data = me.json()
-    except ValueError:
-        me_data = {}
-    if not me.ok or not me_data.get("ok"):
-        raise RuntimeError(
-            "BOT_TOKEN معتبر نیست یا Telegram پاسخ معتبر نداد: "
-            + str(me_data.get("description") or me.text[:300])
-        )
-
-    target = requests.get(
-        f"{base}/getChat",
-        params={"chat_id": TARGET_CHAT_ID},
-        timeout=20,
-    )
-    try:
-        target_data = target.json()
-    except ValueError:
-        target_data = {}
-    if not target.ok or not target_data.get("ok"):
-        raise RuntimeError(
-            "TARGET_CHAT_ID قابل دسترسی نیست: "
-            + str(target_data.get("description") or target.text[:300])
-        )
-
-    return me_data.get("result", {}), target_data.get("result", {})
-
-
-def test_sources_connection():
-    """تست خواندن عمومی کانال‌ها؛ فقط GET و بدون ارسال یا تغییر داده در Telegram."""
-    results = []
-    for channel in SOURCE_CHANNELS:
-        url = f"https://t.me/s/{channel}"
-        try:
-            response = requests.get(url, timeout=(10, 30), headers=HTTP_HEADERS)
-            response.raise_for_status()
-            posts = extract_telegram_posts_from_html(channel, response.text)
-            results.append((channel, True, len(posts), "OK"))
-        except Exception as exc:
-            results.append((channel, False, 0, str(exc)[:180]))
-    return results
-
-
-def run_safe_test_mode():
-    """اجرای تست کامل و سپس خروج؛ TEST_MODE هرگز dispatch_item/process_queue را اجرا نمی‌کند."""
-    print("=" * 60)
-    print("Raptor News Bot v3.5 — SAFE TEST MODE")
-    print("هیچ پست، عکس یا ویدیویی به Telegram ارسال نخواهد شد.")
-    print("=" * 60)
-
-    validate_config()
-    print(f"[PASS] Variables پایه: {len(SOURCE_CHANNELS)} source و {len(GEMINI_API_KEYS)} Gemini key")
-    print(f"[PASS] Gemini model: {GEMINI_MODEL}")
-    print(f"[PASS] Schedule: 08-14 هر {MORNING_POST_SPACING_MINUTES} دقیقه | 14-24 هر {AFTERNOON_POST_SPACING_MINUTES} دقیقه")
-    print("[PASS] TEST_MODE فعال است؛ مسیر انتشار غیرفعال است.")
-
-    # Telegram: فقط خواندن اطلاعات ربات/کانال
-    me, target = test_telegram_connection()
-    print(f"[PASS] Telegram BOT_TOKEN: @{me.get('username') or me.get('first_name', 'unknown')}")
-    print(f"[PASS] TARGET_CHAT_ID: {target.get('title') or target.get('username') or target.get('id')}")
-
-    # Source channels
-    source_results = test_sources_connection()
-    for channel, ok, count, detail in source_results:
-        if ok:
-            print(f"[PASS] Source @{channel}: {count} post قابل خواندن")
-        else:
-            print(f"[FAIL] Source @{channel}: {detail}")
-    if not all(row[1] for row in source_results):
-        raise RuntimeError("حداقل یک source channel قابل خواندن نیست.")
-
-    # Gemini: فقط یک درخواست کوچک با کلید اول
-    gemini_ok, gemini_text = test_gemini_connection()
-    if not gemini_ok:
-        raise RuntimeError("Gemini پاسخ متنی معتبر برنگرداند.")
-    print(f"[PASS] Gemini API: {gemini_text[:80]}")
-
-    # ساخت caption واقعی بدون ارسال
-    sample = {
-        "title": "تست تیتر خبر رپتور",
-        "body": "این فقط یک تست داخلی است و به کانال ارسال نمی‌شود.",
-        "verification": "reported",
-        "category": "military",
-    }
-    caption = build_media_caption(format_public_title(sample), format_public_body(sample), 1024)
-    print(f"[PASS] Media caption: {len(caption)} کاراکتر، حداکثر مجاز 1024")
-    print("[PASS] پایان تست؛ هیچ پیام/عکس/ویدیویی ارسال نشد.")
-    print("=" * 60)
-
-# ============================================================
 # Main
 # ============================================================
 
 def main():
-    if TEST_MODE:
-        run_safe_test_mode()
-        return
-
     validate_config()
 
     state = load_state()
@@ -2674,7 +2529,7 @@ def main():
     save_state(state)
 
     log.info("==============================================")
-    log.info("Raptor News Bot v3.5 شروع شد")
+    log.info("Raptor News Bot v3 (Level 1-3) شروع شد")
     log.info("Telegram sources: %s", len(SOURCE_CHANNELS))
     log.info("Gemini keys: %s", len(GEMINI_API_KEYS))
     log.info("Gemini model: %s", GEMINI_MODEL)
