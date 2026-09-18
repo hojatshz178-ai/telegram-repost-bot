@@ -69,7 +69,7 @@ SOURCE_CHANNELS = [
     for x in split_csv(os.environ.get("SOURCE_CHANNELS", ""))
 ]
 
-# هر تعداد کلید را قبول می‌کند؛ برای تنظیم فعلی کاربر 14 کلید را در همین متغیر قرار بده.
+# هر تعداد کلید یکتا را قبول می‌کند؛ تعداد کلیدها به‌تنهایی محدودیت پروژه Gemini را افزایش نمی‌دهد.
 _raw_gemini_keys = (
     os.environ.get("GEMINI_API_KEYS")
     or os.environ.get("GEMINI_API_KEY", "")
@@ -84,6 +84,15 @@ GEMINI_API_URL = (
 )
 
 POLL_INTERVAL_SECONDS = max(30, env_int("POLL_INTERVAL_SECONDS", 180))
+
+# کنترل مصرف Gemini در نسخه 3.8.
+# چند کلید به‌تنهایی محدودیت پروژه را دور نمی‌زنند؛ بنابراین درخواست‌ها را
+# در سطح پروژه هم کنترل می‌کنیم و بعد از 429، همه کلیدها موقتاً متوقف می‌شوند.
+GEMINI_MAX_ATTEMPTS_PER_REQUEST = max(1, min(3, env_int("GEMINI_MAX_ATTEMPTS_PER_REQUEST", 3)))
+GEMINI_MIN_REQUEST_INTERVAL_SECONDS = max(0, env_int("GEMINI_MIN_REQUEST_INTERVAL_SECONDS", 6))
+GEMINI_MAX_OUTPUT_TOKENS = max(400, min(1800, env_int("GEMINI_MAX_OUTPUT_TOKENS", 900)))
+GEMINI_GLOBAL_COOLDOWN_FLOOR_SECONDS = max(30, env_int("GEMINI_GLOBAL_COOLDOWN_FLOOR_SECONDS", 60))
+TEST_MODE = os.environ.get("TEST_MODE", "false").strip().lower() in {"1", "true", "yes", "on"}
 
 # تشخیص تکرار بین منابع.
 DEDUP_WINDOW_MINUTES = max(60, env_int("DEDUP_WINDOW_MINUTES", 360))
@@ -482,6 +491,8 @@ def default_state():
         "_last_posted_regions": [],
         "_last_posted_buckets": [],
         "_gemini_keys": {},
+        "_gemini_global_cooldown_until": 0,
+        "_gemini_last_request_ts": 0,
     }
 
 
@@ -1148,20 +1159,43 @@ def analyze_and_rewrite(batch_posts, source_name):
         },
     }
 
-    initialize_gemini_key_state_for_call = True
-    del initialize_gemini_key_state_for_call
+    state = load_call_state_cache
+    if state is None:
+        raise RuntimeError("state برای تماس Gemini در دسترس نیست.")
 
-    # حداکثر چند دور کامل روی کلیدهای سالم.
-    total_attempts = max(1, len(GEMINI_API_KEYS) * 2)
+    # محدودیت Gemini در سطح پروژه اعمال می‌شود؛ بنابراین بعد از 429، کلیدهای
+    # متعدد را پشت سر هم امتحان نمی‌کنیم.
+    global_cooldown = float(state.get("_gemini_global_cooldown_until", 0) or 0)
+    now = now_ts()
+    if global_cooldown > now:
+        remaining = int(global_cooldown - now)
+        raise RuntimeError(
+            f"Gemini در cooldown سراسری است؛ حدود {remaining} ثانیه دیگر دوباره تلاش می‌شود."
+        )
+
+    # فاصله حداقلی بین درخواست‌های متوالی برای جلوگیری از burst.
+    last_request = float(state.get("_gemini_last_request_ts", 0) or 0)
+    wait_for = GEMINI_MIN_REQUEST_INTERVAL_SECONDS - (now - last_request)
+    if wait_for > 0:
+        time.sleep(wait_for)
+
+    total_attempts = min(
+        GEMINI_MAX_ATTEMPTS_PER_REQUEST,
+        max(1, len(GEMINI_API_KEYS)),
+    )
     last_error = None
+    attempted = 0
 
-    for attempt in range(total_attempts):
-        available = choose_available_key(load_call_state_cache, _gemini_cursor)
+    for _ in range(total_attempts):
+        available = choose_available_key(state, _gemini_cursor)
         if not available:
-            continue
+            break
 
         idx, key = available[0]
         _gemini_cursor = (idx + 1) % len(GEMINI_API_KEYS)
+        attempted += 1
+        state["_gemini_last_request_ts"] = now_ts()
+        save_state(state)
 
         try:
             headers = {
@@ -1179,7 +1213,8 @@ def analyze_and_rewrite(batch_posts, source_name):
             status = resp.status_code
 
             if status == 200:
-                set_key_success(load_call_state_cache, key)
+                set_key_success(state, key)
+                state["_gemini_global_cooldown_until"] = 0
                 data = resp.json()
                 candidates = data.get("candidates", [])
                 if not candidates:
@@ -1193,21 +1228,30 @@ def analyze_and_rewrite(batch_posts, source_name):
                 if not items and "relevant" in parsed:
                     items = [parsed]
 
+                save_state(state)
                 return validate_gemini_items(items)
 
             if status == 429:
-                cooldown = retry_after_from_response(resp, 60)
-                set_key_failure(load_call_state_cache, key, status, cooldown)
+                cooldown = retry_after_from_response(
+                    resp, GEMINI_GLOBAL_COOLDOWN_FLOOR_SECONDS
+                )
+                cooldown = max(GEMINI_GLOBAL_COOLDOWN_FLOOR_SECONDS, cooldown)
+                state["_gemini_global_cooldown_until"] = now_ts() + cooldown
+                set_key_failure(state, key, status, cooldown)
+                save_state(state)
                 log.warning(
-                    "کلید Gemini با 429 مواجه شد؛ کلید %s برای %s ثانیه cooldown شد.",
-                    key_id(key),
+                    "Gemini 429؛ cooldown سراسری %s ثانیه فعال شد.",
                     cooldown,
                 )
-                continue
+                raise RuntimeError(
+                    f"Gemini HTTP 429؛ cooldown سراسری {cooldown} ثانیه فعال شد."
+                )
 
             if status in (500, 502, 503, 504):
-                cooldown = min(120, 20 * (1 + attempt // max(1, len(GEMINI_API_KEYS))))
-                set_key_failure(load_call_state_cache, key, status, cooldown)
+                cooldown = min(120, 20 * (1 + attempted))
+                set_key_failure(state, key, status, cooldown)
+                save_state(state)
+                last_error = RuntimeError(f"Gemini HTTP {status}")
                 log.warning(
                     "Gemini موقتاً خطا داد (%s)؛ کلید %s موقتاً کنار گذاشته شد.",
                     status,
@@ -1216,28 +1260,28 @@ def analyze_and_rewrite(batch_posts, source_name):
                 continue
 
             if status in (401, 403):
-                # ممکن است کلید نامعتبر یا غیرفعال باشد؛ cooldown بلندتر تا در هر poll تکرار نشود.
-                set_key_failure(load_call_state_cache, key, status, 6 * 3600)
+                set_key_failure(state, key, status, 6 * 3600)
+                save_state(state)
+                last_error = RuntimeError(f"Gemini HTTP {status}")
                 log.error(
-                    "کلید Gemini %s خطای %s داد؛ برای ۶ ساعت cooldown شد.",
+                    "کلید Gemini %s خطای %s داد؛ برای ۶ ساعت کنار گذاشته شد.",
                     key_id(key),
                     status,
                 )
                 continue
 
-            # خطاهای غیرقابل‌حل برای این درخواست.
+            # 400/404 و خطاهای مشابه را با کلیدهای دیگر تکرار نکن؛ مشکل معمولاً
+            # از درخواست/مدل است، نه از کلید.
             raise RuntimeError(
                 f"Gemini HTTP {status}: {truncate_text(resp.text, 700)}"
             )
 
+        except RuntimeError:
+            raise
         except (requests.Timeout, requests.ConnectionError, requests.RequestException) as exc:
             last_error = exc
-            # خطای شبکه به یک کلید خاص نسبت داده نمی‌شود؛ ولی کلید فعلی را کوتاه cooldown می‌کنیم
-            # تا در صورت مشکل شبکه از چرخش کلید بی‌مورد جلوگیری شود.
-            try:
-                set_key_failure(load_call_state_cache, key, -1, 30)
-            except Exception:
-                pass
+            set_key_failure(state, key, -1, 30)
+            save_state(state)
             log.warning(
                 "خطای شبکه هنگام اتصال به Gemini با کلید %s: %s",
                 key_id(key),
@@ -1247,11 +1291,10 @@ def analyze_and_rewrite(batch_posts, source_name):
         except Exception as exc:
             last_error = exc
             log.error("خطا در پردازش پاسخ Gemini: %s", exc)
-            # خطای parse پاسخ به کلید ربطی ندارد؛ کلید را از چرخه خارج نمی‌کنیم.
-            continue
+            raise
 
     raise RuntimeError(
-        f"پس از {total_attempts} تلاش، Gemini موفق نشد. آخرین خطا: {last_error}"
+        f"پس از {attempted} تلاش محدود، Gemini موفق نشد. آخرین خطا: {last_error}"
     )
 
 
@@ -1736,38 +1779,31 @@ def send_video_to_telegram(title, body, video_url):
                 pass
 
 
-def public_category_label(item):
-    labels = {
-        "military": "🛡️ نظامی",
-        "security": "🔐 امنیتی",
-        "defense": "🛰️ دفاعی",
-        "geopolitics": "🌍 ژئوپلیتیک",
-        "technology": "💻 فناوری",
-        "general": "📰 خبر",
-    }
-    return labels.get(item.get("category", "general"), labels["general"])
-
-
-def public_verification_label(item):
-    labels = {
-        "reported": "⚠️ گزارش اولیه",
-        "developing": "🔄 خبر در حال تکمیل",
-        "confirmed": "✅ تأییدشده در متن گزارش",
-        "analysis": "📊 تحلیل",
-    }
-    return labels.get(item.get("verification", "reported"), labels["reported"])
-
-
 def format_public_title(item):
-    title = normalize_space(item.get("title", ""))
-    return f"{public_category_label(item)} | {title}" if title else ""
+    # نسخه 3.8: تیتر مستقیم و طبیعی؛ هیچ برچسب دسته‌بندی جداگانه‌ای اضافه نمی‌شود.
+    return normalize_space(item.get("title", ""))
 
 
 def format_public_body(item):
+    # وضعیت خبر در نثر طبیعی بیان می‌شود، نه به‌صورت برچسب جداگانه.
     body = (item.get("body", "") or "").strip()
-    status = public_verification_label(item)
-    return f"{status}\n\n{body}" if body else status
+    verification = item.get("verification", "reported")
+    normalized = normalize_for_match(body)
 
+    if verification == "reported" and body:
+        cues = ("بر اساس گزارش", "به گفته", "مدعی", "گزارش اولیه", "گزارش‌های اولیه", "گزارش های اولیه", "تاکنون تایید", "تاکنون تأیید", "تایید رسمی", "تأیید رسمی")
+        if not any(normalize_for_match(x) in normalized for x in cues):
+            body = "بر اساس گزارش‌های اولیه، " + body[0].lower() + body[1:] if len(body) > 1 else "بر اساس گزارش‌های اولیه، " + body
+    elif verification == "developing" and body:
+        cues = ("در حال تکمیل", "جزئیات", "هنوز")
+        if not any(normalize_for_match(x) in normalized for x in cues):
+            body += "\n\nجزئیات این خبر همچنان در حال تکمیل است."
+    elif verification == "analysis" and body:
+        cues = ("ارزیابی", "تحلیل", "به نظر", "احتمال")
+        if not any(normalize_for_match(x) in normalized for x in cues):
+            body = "در ارزیابی اولیه، " + body[0].lower() + body[1:] if len(body) > 1 else "در ارزیابی اولیه، " + body
+
+    return body
 
 def build_text_only_message(item):
     # لینک/نام منبع عمداً در پست نهایی نمایش داده نمی‌شود.
@@ -1784,33 +1820,68 @@ def build_text_only_message(item):
     return "\n\n".join(parts)
 
 
+def is_recoverable_media_error(exc):
+    """خطاهای قطعی رسانه که یعنی Telegram خود فایل را نپذیرفته است."""
+    if not isinstance(exc, TelegramAPIError) or exc.status_code != 400:
+        return False
+    desc = normalize_for_match(exc.description or "")
+    media_terms = {
+        "photo_invalid_dimensions",
+        "wrong file identifier",
+        "bad request photo",
+        "photo",
+        "video",
+        "file is too big",
+        "wrong type of the web page content",
+    }
+    return any(normalize_for_match(term) in desc for term in media_terms)
+
+
 def dispatch_item(item):
+    if TEST_MODE:
+        log.info(
+            "TEST_MODE فعال است؛ انتشار واقعی انجام نشد | title=%s | media=%s",
+            format_public_title(item),
+            "video" if item.get("video") else ("photo" if item.get("photo") else "none"),
+        )
+        return True
+
     title = format_public_title(item)
     body = format_public_body(item)
     photo = item.get("photo")
     video = item.get("video")
 
-    # منبع/لینک منبع در خروجی کانال نمایش داده نمی‌شود.
-    media_body = body
-
+    # اگر رسانه خراب/نامعتبر باشد، همان خبر بدون رسانه منتشر می‌شود.
+    # 429 عمداً fallback نمی‌شود؛ چون مشکل rate limit است نه فایل.
     if video:
         try:
-            send_video_to_telegram(title, media_body, video)
+            send_video_to_telegram(title, body, video)
             return True
-        except TelegramAPIError:
-            raise
+        except TelegramAPIError as exc:
+            if exc.status_code == 429:
+                raise
+            if is_recoverable_media_error(exc):
+                log.warning("ویدیو توسط Telegram رد شد؛ به عکس/متن fallback می‌کنیم: %s", exc)
+            else:
+                raise
         except Exception as exc:
-            log.warning("ارسال ویدیو شکست خورد؛ به عکس/متن fallback می‌کنیم: %s", exc)
+            log.warning("دریافت/ارسال ویدیو شکست خورد؛ به عکس/متن fallback می‌کنیم: %s", exc)
 
     if photo:
         try:
-            send_photo_to_telegram(title, media_body, photo)
+            send_photo_to_telegram(title, body, photo)
             return True
-        except TelegramAPIError:
-            raise
+        except TelegramAPIError as exc:
+            if exc.status_code == 429:
+                raise
+            if is_recoverable_media_error(exc):
+                log.warning("عکس توسط Telegram رد شد؛ به متن fallback می‌کنیم: %s", exc)
+            else:
+                raise
         except Exception as exc:
-            log.warning("ارسال عکس شکست خورد؛ به متن fallback می‌کنیم: %s", exc)
+            log.warning("دریافت/ارسال عکس شکست خورد؛ به متن fallback می‌کنیم: %s", exc)
 
+    # در صورت شکست رسانه، متن کامل خبر منتشر می‌شود؛ ادامه‌ی جداگانه‌ای برای رسانه نداریم.
     send_text_to_telegram(build_text_only_message(item))
     return True
 
@@ -2533,6 +2604,9 @@ def main():
     log.info("Telegram sources: %s", len(SOURCE_CHANNELS))
     log.info("Gemini keys: %s", len(GEMINI_API_KEYS))
     log.info("Gemini model: %s", GEMINI_MODEL)
+    log.info("TEST_MODE: %s", TEST_MODE)
+    log.info("Gemini max attempts/request: %s", GEMINI_MAX_ATTEMPTS_PER_REQUEST)
+    log.info("Gemini min request interval: %s sec", GEMINI_MIN_REQUEST_INTERVAL_SECONDS)
     log.info("Publish spacing: 08-14=%s دقیقه | 14-24=%s دقیقه", MORNING_POST_SPACING_MINUTES, AFTERNOON_POST_SPACING_MINUTES)
     log.info("Event cluster max inputs: %s", EVENT_MAX_ITEMS_PER_CLUSTER)
     log.info("Event cluster max outputs: %s", EVENT_MAX_OUTPUT_ITEMS)
