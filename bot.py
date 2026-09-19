@@ -346,6 +346,8 @@ REWRITE_PROMPT = """تو «سردبیر ارشد» یک کانال خبری فا
 - کلیک‌خور بودن فقط با وضوح و اهمیت واقعی خبر ایجاد شود، نه با اغراق.
 - هیچ ادعای تأییدنشده‌ای را به‌عنوان واقعیت قطعی ننویس.
 - اگر منبع ادعایی را مطرح کرده، وضعیت آن ادعا را طبیعی و کوتاه در متن بیان کن؛ هرگز برچسب‌هایی مثل «⚠️ گزارش اولیه» را جداگانه ننویس.
+- نام کانال، یوزرنیم، آیدی، لینک یا عبارت‌هایی مثل «به نقل از کانال ...»، «کانال ... گزارش داد»، «به گفته کانال ...» یا «این خبر از کانال ... برداشته شده» را هرگز در title، body یا significance نیاور. نام منبع فقط برای پردازش داخلی است و نباید وارد متن قابل انتشار شود.
+- اگر لازم است وضعیت اعتبار یک ادعا بیان شود، بدون ذکر نام کانال یا یوزرنیم و با عباراتی عمومی مثل «بر اساس گزارش‌های اولیه» یا «این ادعا هنوز تأیید مستقل نشده» بیانش کن.
 - محتوایی که در ورودی نیست را نساز. عدد، نام، تاریخ، مکان و توانایی‌ها را حدس نزن.
 - خبر کم‌ارزش، تبلیغاتی، دعوت به عضویت، کپشن تکراری یا محتوای بدون ارزش خبری را relevant=false کن.
 
@@ -2358,13 +2360,57 @@ def send_video_to_telegram(title, body, video_url):
                 pass
 
 
+def strip_source_channel_attribution(text):
+    """
+    نام/یوزرنیم کانال‌های منبع نباید وارد پست عمومی شوند.
+    این پاک‌سازی فقط attribution به کانال‌های منبع را هدف می‌گیرد و
+    تلاش می‌کند نام سازمان‌ها، کشورها و منابع رسمی داخل متن خبر را دست‌نخورده نگه دارد.
+    """
+    text = normalize_persian_text(text)
+    if not text:
+        return ""
+
+    patterns = [
+        # «به نقل/گزارش کانال @name» و حالت‌های مشابه
+        r"(?i)\b(?:به\s+)?(?:نقل|گزارش)\s+از\s+(?:کانال|چنل)\s+[@#]?[A-Za-z0-9_\-]+",
+        r"(?i)\bبه\s+نقل\s+از\s+(?:کانال|چنل)\s+[^،.!؟\n]+",
+        r"(?i)\b(?:به\s+گفته|بر\s+اساس\s+گزارش)\s+(?:کانال|چنل)\s+[@#]?[A-Za-z0-9_\-]+",
+        r"(?i)\b(?:کانال|چنل)\s+[@#][A-Za-z0-9_\-]+\s+(?:گزارش\s+داد|اعلام\s+کرد|نوشت|مدعی\s+شد)",
+        r"(?i)\b(?:کانال|چنل)\s+[@#][A-Za-z0-9_\-]+",
+    ]
+    for pattern in patterns:
+        text = re.sub(pattern, "", text)
+
+    # نام‌های منبع فعلی ربات را نیز اگر به شکل plain text داخل attribution آمده باشند، حذف کن.
+    for channel in SOURCE_CHANNELS:
+        if not channel:
+            continue
+        text = re.sub(
+            rf"(?i)(?<![A-Za-z0-9_])(?:کانال|چنل)\s+@?{re.escape(channel)}\b",
+            "",
+            text,
+        )
+        text = re.sub(
+            rf"(?i)(?<![A-Za-z0-9_])@{re.escape(channel)}\b",
+            "",
+            text,
+        )
+
+    # فاصله/نشانه‌گذاری باقی‌مانده از حذف attribution را مرتب کن.
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\s+([،؛؟!])", r"\1", text)
+    text = re.sub(r"([،؛])\s*(?=[،؛])", r"\1 ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip(" \n،؛")
+
+
 def format_public_title(item):
-    return normalize_persian_text(item.get("title", ""))
+    return strip_source_channel_attribution(item.get("title", ""))
 
 
 def format_public_body(item):
     """خروجی نهایی طبیعی است؛ وضعیت تأیید داخل نثر و significance فقط در صورت نیاز می‌آید."""
-    body = normalize_persian_text(item.get("body", ""))
+    body = strip_source_channel_attribution(item.get("body", ""))
     verification = str(item.get("verification", "reported") or "reported").lower()
     normalized = normalize_for_match(body)
 
@@ -2396,7 +2442,7 @@ def format_public_body(item):
             first = body[0].lower() + body[1:] if len(body) > 1 else body
             body = "در ارزیابی اولیه، " + first
 
-    significance = normalize_persian_text(item.get("significance", ""))
+    significance = strip_source_channel_attribution(item.get("significance", ""))
     if significance and len(significance) >= 35:
         sim = token_similarity(body, significance)
         if sim < 0.72:
