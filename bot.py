@@ -140,6 +140,28 @@ AI_429_MAX_COOLDOWN_SECONDS = max(
 AI_FAILURE_RETRY_MINUTES = max(
     3, env_int("AI_FAILURE_RETRY_MINUTES", 10)
 )
+# Retry چرخه پردازش محتوا: تعداد تلاش محدود + backoff نمایی.
+# بعد از رسیدن به سقف، UID برای یک بازه قرنطینه می‌شود تا یک خبر خراب
+# باعث retry بی‌نهایت و مصرف مداوم AI نشود؛ بعداً دوباره قابل تلاش است.
+AI_RETRY_MAX_ATTEMPTS = max(
+    2, min(6, env_int("AI_RETRY_MAX_ATTEMPTS", 5))
+)
+AI_RETRY_MAX_DELAY_MINUTES = max(
+    AI_FAILURE_RETRY_MINUTES,
+    min(24 * 60, env_int("AI_RETRY_MAX_DELAY_MINUTES", 120))
+)
+AI_RETRY_QUARANTINE_MINUTES = max(
+    AI_RETRY_MAX_DELAY_MINUTES,
+    min(72 * 60, env_int("AI_RETRY_QUARANTINE_MINUTES", 24 * 60))
+)
+# Backoff داخلی درخواست‌های موقت provider؛ با jitter کوچک از retry هم‌زمان جلوگیری می‌شود.
+AI_PROVIDER_RETRY_BASE_SECONDS = max(
+    1, min(10, env_int("AI_PROVIDER_RETRY_BASE_SECONDS", 2))
+)
+AI_PROVIDER_RETRY_MAX_SECONDS = max(
+    AI_PROVIDER_RETRY_BASE_SECONDS,
+    min(60, env_int("AI_PROVIDER_RETRY_MAX_SECONDS", 20))
+)
 EDITOR_ENABLED = os.environ.get("AI_EDITOR_ENABLED", "true").strip().lower() in {
     "1", "true", "yes", "on"
 }
@@ -459,6 +481,7 @@ entities فهرست کوتاه نام‌های کلیدی همان رویداد 
 {
   "items": [
     {
+      "draft_id": 0,
       "relevant": true,
       "duplicate": false,
       "is_update": false,
@@ -1312,10 +1335,94 @@ def provider_model_name(provider):
     return AI_PROVIDER_MODELS[provider]
 
 
+def groq_structured_output_schema():
+    """Schema مشترک Groq برای Stage 1 و Stage 2؛ strict mode خطای JSON validation را حذف می‌کند."""
+    item_properties = {
+        "draft_id": {"type": "integer"},
+        "relevant": {"type": "boolean"},
+        "duplicate": {"type": "boolean"},
+        "duplicate_reason": {"type": "string"},
+        "is_update": {"type": "boolean"},
+        "novelty_score": {"type": "integer"},
+        "event_key": {"type": "string"},
+        "title": {"type": "string"},
+        "body": {"type": "string"},
+        "significance": {"type": "string"},
+        "image_query": {"type": "string"},
+        "post_indices": {
+            "type": "array",
+            "items": {"type": "integer"},
+        },
+        "content_bucket": {"type": "string"},
+        "region": {"type": "string"},
+        "event_type": {"type": "string"},
+        "category": {"type": "string"},
+        "verification": {"type": "string"},
+        "urgent": {"type": "boolean"},
+        "important": {"type": "boolean"},
+        "needs_editor": {"type": "boolean"},
+        "style_mode": {"type": "string"},
+        "length_class": {"type": "string"},
+        "priority_hint": {"type": "integer"},
+        "source_note": {"type": "string"},
+        "entities": {
+            "type": "array",
+            "items": {"type": "string"},
+        },
+    }
+    item_required = list(item_properties.keys())
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "raptor_news_items",
+            "strict": True,
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "items": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": item_properties,
+                            "required": item_required,
+                            "additionalProperties": False,
+                        },
+                    }
+                },
+                "required": ["items"],
+                "additionalProperties": False,
+            },
+        },
+    }
+
+
 def provider_prompt_payload(provider, prompt, max_output_tokens):
-    if provider in {"groq", "mistral"}:
-        temperature = 0.15 if provider == "groq" else 0.18
+    if provider == "groq":
         payload = {
+            "model": provider_model_name(provider),
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "Return only the JSON object required by the supplied schema. "
+                        "Do not add Markdown or commentary. "
+                        "Every required field must be present."
+                    ),
+                },
+                {"role": "user", "content": prompt},
+            ],
+            "temperature": 0.15,
+            # max_completion_tokens is the current Groq parameter.
+            "max_completion_tokens": max_output_tokens,
+            # GPT-OSS supports include_reasoning=false; this keeps reasoning out of
+            # the structured output path and leaves the token budget for JSON itself.
+            "include_reasoning": False,
+            "response_format": groq_structured_output_schema(),
+        }
+        return payload
+
+    if provider == "mistral":
+        return {
             "model": provider_model_name(provider),
             "messages": [
                 {
@@ -1324,11 +1431,10 @@ def provider_prompt_payload(provider, prompt, max_output_tokens):
                 },
                 {"role": "user", "content": prompt},
             ],
-            "temperature": temperature,
+            "temperature": 0.18,
             "max_tokens": max_output_tokens,
             "response_format": {"type": "json_object"},
         }
-        return payload
 
     return {
         "contents": [
@@ -1504,12 +1610,17 @@ def call_single_provider(state, provider, prompt, task_name):
                 )
 
             if status in (408, 409, 425, 500, 502, 503, 504):
-                cooldown = min(90, 10 * (attempt + 1))
+                backoff = min(
+                    AI_PROVIDER_RETRY_MAX_SECONDS,
+                    AI_PROVIDER_RETRY_BASE_SECONDS * (2 ** attempt),
+                )
+                cooldown = min(90, max(10, backoff))
                 mark_key_cooldown(state, provider, key, cooldown, status)
                 last_error = AIProviderError(provider, status, truncate_text(response.text, 500))
                 save_state(state)
                 if attempt + 1 < attempts:
-                    time.sleep(min(2.0, cooldown / 5.0))
+                    jitter = 0.25 + (0.25 * (int(sha1_text(key_id(key))[:6], 16) % 100) / 100.0)
+                    time.sleep(min(AI_PROVIDER_RETRY_MAX_SECONDS, backoff + jitter))
                     continue
                 raise last_error
 
@@ -1523,9 +1634,15 @@ def call_single_provider(state, provider, prompt, task_name):
             raise
         except (requests.Timeout, requests.ConnectionError, requests.RequestException) as exc:
             last_error = exc
-            mark_key_cooldown(state, provider, key, 20, -1)
+            backoff = min(
+                AI_PROVIDER_RETRY_MAX_SECONDS,
+                AI_PROVIDER_RETRY_BASE_SECONDS * (2 ** attempt),
+            )
+            mark_key_cooldown(state, provider, max(20, int(backoff)), -1)
             save_state(state)
             if attempt + 1 < attempts:
+                jitter = 0.25 + (0.25 * (int(sha1_text(key_id(key))[:6], 16) % 100) / 100.0)
+                time.sleep(min(AI_PROVIDER_RETRY_MAX_SECONDS, backoff + jitter))
                 continue
         except Exception as exc:
             last_error = exc
@@ -1837,7 +1954,7 @@ def final_editor(state, drafts, source_posts, first_provider):
     if not EDITOR_ENABLED or not drafts:
         return drafts, first_provider
 
-    drafts = drafts[:AI_EDITOR_MAX_ITEMS]
+    drafts = drafts[:min(AI_EDITOR_MAX_ITEMS, EVENT_MAX_OUTPUT_ITEMS)]
     prompt = build_editor_prompt(state, drafts, source_posts)
     order = rotate_provider_order(first_provider)
     try:
@@ -2810,18 +2927,67 @@ def clear_retry_uids(state, posts):
 
 def mark_retry_uids(state, posts, minutes=None):
     retry = state.setdefault("_retry_uids", {})
-    until = now_ts() + 60 * (minutes or AI_FAILURE_RETRY_MINUTES)
+    base_minutes = max(3, int(minutes or AI_FAILURE_RETRY_MINUTES))
+    now = now_ts()
+
     for post in posts:
         uid = post.get("uid")
-        if uid:
-            retry[uid] = until
+        if not uid:
+            continue
+
+        previous = retry.get(uid)
+        if isinstance(previous, dict):
+            attempts = int(previous.get("attempts", 0) or 0) + 1
+        else:
+            # سازگاری با state قدیمی که فقط timestamp ذخیره می‌کرد.
+            attempts = 1
+
+        if attempts >= AI_RETRY_MAX_ATTEMPTS:
+            delay_minutes = AI_RETRY_QUARANTINE_MINUTES
+            retry[uid] = {
+                "until": now + delay_minutes * 60,
+                "attempts": attempts,
+                "quarantined": True,
+            }
+            log.warning(
+                "UID پس از %s تلاش ناموفق وارد قرنطینه %s دقیقه‌ای شد: %s",
+                attempts, delay_minutes, uid,
+            )
+            continue
+
+        delay_minutes = min(
+            AI_RETRY_MAX_DELAY_MINUTES,
+            base_minutes * (2 ** (attempts - 1)),
+        )
+        retry[uid] = {
+            "until": now + delay_minutes * 60,
+            "attempts": attempts,
+            "quarantined": False,
+        }
 
 
 def is_retry_blocked(state, uid):
     if not uid:
         return False
     retry = state.get("_retry_uids", {})
-    until = float(retry.get(uid, 0) or 0)
+    entry = retry.get(uid)
+
+    if isinstance(entry, dict):
+        until = float(entry.get("until", 0) or 0)
+        if until <= now_ts():
+            # تلاش‌های عادی باید حفظ شوند تا backoff واقعاً نمایی باشد؛
+            # فقط پس از پایان quarantine چرخه retry از نو شروع می‌شود.
+            if entry.get("quarantined"):
+                retry.pop(uid, None)
+            return False
+        return True
+
+    # سازگاری با نسخه قبلی: مقدار قدیمی فقط timestamp بود.
+    try:
+        until = float(entry or 0)
+    except (TypeError, ValueError):
+        retry.pop(uid, None)
+        return False
     if until <= now_ts():
         retry.pop(uid, None)
         return False
