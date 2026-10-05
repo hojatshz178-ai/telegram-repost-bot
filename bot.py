@@ -70,7 +70,7 @@ SOURCE_CHANNELS = [
 ]
 
 # ============================================================
-# AI providers — v4
+# AI providers — v4.5
 # ============================================================
 # ترتیب عمداً ثابت است:
 #   1) Groq = موتور اصلی
@@ -128,8 +128,10 @@ AI_MAX_ATTEMPTS_PER_PROVIDER = max(
 AI_MIN_REQUEST_INTERVAL_SECONDS = max(
     0.0, env_float("AI_MIN_REQUEST_INTERVAL_SECONDS", 1.2)
 )
+# خروجی Groq به‌ویژه در Structured Outputs باید فضای کافی برای JSON کامل داشته باشد.
+# مقدار پایین قدیمی مثل 1400 دیگر نمی‌تواند سقف را بیش از حد محدود کند.
 AI_MAX_OUTPUT_TOKENS = max(
-    700, min(2200, env_int("AI_MAX_OUTPUT_TOKENS", 1400))
+    2400, min(4000, env_int("AI_MAX_OUTPUT_TOKENS", 2600))
 )
 AI_PROVIDER_COOLDOWN_FLOOR_SECONDS = max(
     20, env_int("AI_PROVIDER_COOLDOWN_FLOOR_SECONDS", 45)
@@ -181,6 +183,19 @@ AI_RECENT_INPUT_WINDOW_MINUTES = max(
 AI_LOCAL_DUP_THRESHOLD = min(
     0.97, max(0.90, env_float("AI_LOCAL_DUP_THRESHOLD", 0.94))
 )
+
+# امتیاز ارزش خبری: خبرهای زیر 50 اصلاً وارد صف نمی‌شوند.
+# بازه 50-64 فقط در صورتی منتشر می‌شود که گزینه 65+ در صف وجود نداشته باشد.
+MIN_NEWS_SCORE = max(40, min(70, env_int("MIN_NEWS_SCORE", 50)))
+PREFERRED_NEWS_SCORE = max(
+    MIN_NEWS_SCORE,
+    min(90, env_int("PREFERRED_NEWS_SCORE", 65)),
+)
+
+# تصویر عمومی نامرتبط می‌تواند اعتبار یک پست را خراب کند؛ پیش‌فرض خاموش است.
+ALLOW_GENERIC_IMAGE_FALLBACK = os.environ.get(
+    "ALLOW_GENERIC_IMAGE_FALLBACK", "false"
+).strip().lower() in {"1", "true", "yes", "on"}
 
 # ============================================================
 # Dedup / event memory — deliberately stronger than v3.8
@@ -357,119 +372,184 @@ STOPWORDS = {
 # Prompt
 # ============================================================
 
+
+# ============================================================
+# Editorial terminology / spelling guardrails
+# ============================================================
+
+# این واژه‌نامه برای جلوگیری از ترجمه تحت‌اللفظی اصطلاحات رایج نظامی است.
+# فهرست عمداً محافظه‌کارانه است و مدل اجازه ندارد برای اصطلاح نامطمئن معادل عجیب بسازد.
+PREFERRED_MILITARY_TERMS = {
+    "air defense": "پدافند هوایی",
+    "air defence": "پدافند هوایی",
+    "surface-to-air missile": "موشک زمین‌به‌هوا",
+    "surface to air missile": "موشک زمین‌به‌هوا",
+    "air-to-air missile": "موشک هوا‌به‌هوا",
+    "air-to-air": "هوا‌به‌هوا",
+    "air-to-ground": "هوا‌به‌زمین",
+    "ground-to-ground": "زمین‌به‌زمین",
+    "cruise missile": "موشک کروز",
+    "ballistic missile": "موشک بالستیک",
+    "loitering munition": "مهمات سرگردان",
+    "unmanned aerial vehicle": "پهپاد",
+    "unmanned aerial system": "سامانه پهپادی",
+    "unmanned combat aerial vehicle": "پهپاد رزمی",
+    "infantry fighting vehicle": "خودروی رزمی پیاده‌نظام",
+    "armored personnel carrier": "نفربر زرهی",
+    "main battle tank": "تانک اصلی میدان نبرد",
+    "armored vehicle": "خودروی زرهی",
+    "electronic warfare": "جنگ الکترونیک",
+    "electronic countermeasures": "اقدامات متقابل الکترونیکی",
+    "electronic support measures": "اقدامات پشتیبانی الکترونیکی",
+    "signals intelligence": "اطلاعات سیگنالی",
+    "intelligence, surveillance and reconnaissance": "اطلاعات، مراقبت و شناسایی",
+    "intelligence surveillance and reconnaissance": "اطلاعات، مراقبت و شناسایی",
+    "close air support": "پشتیبانی نزدیک هوایی",
+    "airborne early warning": "هشدار زودهنگام هوابرد",
+    "air refueling": "سوخت‌گیری هوایی",
+    "sortie": "پرواز عملیاتی",
+    "interceptor": "رهگیر",
+    "fighter aircraft": "جنگنده",
+    "fighter jet": "جنگنده",
+    "aircraft carrier": "ناو هواپیمابر",
+    "guided bomb": "بمب هدایت‌شونده",
+    "precision-guided munition": "مهمات هدایت‌شونده دقیق",
+    "counter-drone": "ضدپهپاد",
+    "anti-drone": "ضدپهپاد",
+    "directed-energy weapon": "سلاح انرژی هدایت‌شده",
+    "laser weapon": "سلاح لیزری",
+    "radar": "رادار",
+    "active electronically scanned array": "آرایه فازی فعال",
+    "active electronically scanned array radar": "رادار آرایه فازی فعال",
+    "beyond visual range": "فراتر از دید بصری",
+    "beyond-visual-range": "فراتر از دید بصری",
+    "rules of engagement": "قواعد درگیری",
+    "ceasefire": "آتش‌بس",
+    "deployment": "استقرار",
+    "mobilization": "بسیج نیرو",
+}
+
+PERSIAN_SPELLING_REPLACEMENTS = {
+    "تایید": "تأیید",
+    "تائید": "تأیید",
+    "میتواند": "می‌تواند",
+    "میتوانند": "می‌توانند",
+    "میتوانست": "می‌توانست",
+    "میتوانند": "می‌توانند",
+    "نمیتواند": "نمی‌تواند",
+    "نمیتوانند": "نمی‌توانند",
+    "نمیشود": "نمی‌شود",
+    "میشود": "می‌شود",
+    "میشد": "می‌شد",
+    "میکند": "می‌کند",
+    "میکنند": "می‌کنند",
+    "میکرد": "می‌کرد",
+    "میباشد": "است",
+    "می‌باشد": "است",
+    "بروزرسانی": "به‌روزرسانی",
+    "به روزرسانی": "به‌روزرسانی",
+    "درحال": "در حال",
+    "درحالیکه": "در حالی که",
+    "در حالیکه": "در حالی که",
+    "هیچ گونه": "هیچ‌گونه",
+    "به صورت": "به‌صورت",
+    "به روز": "به‌روز",
+    "هم چنین": "همچنین",
+}
+
+
 REWRITE_PROMPT = """تو «سردبیر ارشد» یک کانال خبری فارسی در حوزه نظامی، امنیتی و ژئوپلیتیکی هستی.
-وظیفه تو ترجمه ساده نیست؛ باید از چند ورودی خام، یک خبر فارسی طبیعی، دقیق، حرفه‌ای و قابل انتشار بسازی.
+وظیفه تو ترجمه کلمه‌به‌کلمه نیست؛ باید از ورودی‌های خام، یک خبر فارسی طبیعی، دقیق، حرفه‌ای و قابل انتشار بسازی.
 
-اصل‌های تحریریه:
-- لحن: خبرنگار فارسی‌زبان واقعی؛ روشن، مستقیم، حرفه‌ای و بدون لحن ماشینی.
-- جمله‌ها کوتاه و خبری باشند. از جمله‌های بسیار بلند و ترجمه‌وار دوری کن.
-- از مقدمه‌های کلیشه‌ای مانند «در تحولات اخیر»، «در ادامه تحولات»، «این موضوع نشان می‌دهد» و عبارت‌های تکراری خودداری کن.
-- تیتر باید بر اساس «اتفاق اصلی» ساخته شود، نه بر اساس یک قالب ثابت. تیترها باید بین پست‌های مختلف تنوع ساختاری داشته باشند.
-- کلیک‌خور بودن فقط با وضوح و اهمیت واقعی خبر ایجاد شود، نه با اغراق.
-- هیچ ادعای تأییدنشده‌ای را به‌عنوان واقعیت قطعی ننویس.
-- اگر منبع ادعایی را مطرح کرده، وضعیت آن ادعا را طبیعی و کوتاه در متن بیان کن؛ هرگز برچسب‌هایی مثل «⚠️ گزارش اولیه» را جداگانه ننویس.
-- نام کانال، یوزرنیم، آیدی، لینک یا عبارت‌هایی مثل «به نقل از کانال ...»، «کانال ... گزارش داد»، «به گفته کانال ...» یا «این خبر از کانال ... برداشته شده» را هرگز در title، body یا significance نیاور. نام منبع فقط برای پردازش داخلی است و نباید وارد متن قابل انتشار شود.
-- اگر لازم است وضعیت اعتبار یک ادعا بیان شود، بدون ذکر نام کانال یا یوزرنیم و با عباراتی عمومی مثل «بر اساس گزارش‌های اولیه» یا «این ادعا هنوز تأیید مستقل نشده» بیانش کن.
-- محتوایی که در ورودی نیست را نساز. عدد، نام، تاریخ، مکان و توانایی‌ها را حدس نزن.
-- خبر کم‌ارزش، تبلیغاتی، دعوت به عضویت، کپشن تکراری یا محتوای بدون ارزش خبری را relevant=false کن.
+اصل طلایی:
+هر چیزی که در ورودی نیست، حق نداری اضافه کنی. هر چیزی که درباره آن مطمئن نیستی، حذف کن یا با زبان روشنِ غیرقطعی بیان کن.
 
-فارسی‌سازی عمیق:
-- نیم‌فاصله طبیعی و صحیح.
-- نشانه‌گذاری فارسی و فاصله‌گذاری درست.
-- ساختار طبیعی فعل‌های فارسی.
-- حذف ترکیب‌های تحت‌اللفظی و ترجمه‌ای.
-- نام‌های تخصصی و اصطلاحات نظامی را دقیق و یکدست نگه دار.
-- اگر نام یک شخص، سازمان، کشور، سامانه یا محل در ورودی وجود دارد، همان را به شکل استاندارد و سازگار استفاده کن.
+1) دقت factual و زمان:
+- تاریخ، ساعت، مکان، نام اشخاص، سازمان‌ها، سامانه‌ها، کشورها و اعداد را از خودت نساز.
+- اگر تاریخ دقیق در ورودی روشن نیست، تاریخ دقیق جدید اختراع نکن.
+- «امروز»، «دیروز»، «فردا» و سنجه‌های نسبی را فقط وقتی استفاده کن که با زمان انتشار منبع سازگار باشند.
+- اگر چند ورودی درباره یک رویداد اختلاف دارند، اختلاف را پنهان نکن و ادعا را قطعی ننویس.
+- «confirmed» فقط وقتی مجاز است که در ورودی پشتوانه روشن و قابل اتکا وجود داشته باشد؛ یک کانال یا یک ادعای ناشناس به‌تنهایی تأیید محسوب نمی‌شود.
+- خبرهای مبهم مثل «دود دیده شد»، «نور در آسمان دیده شد» یا «صدای انفجار شنیده شد» را فقط در صورت وجود جزئیات و ارزش خبری کافی relevant=true کن؛ از ساختن علت یا ارتباط نظامی خودداری کن.
 
-ادغام و حافظه رویداد:
-- چند ورودی درباره یک اتفاق را به یک خبر واحد تبدیل کن.
-- «جزئیات تازه»، «تصاویر جدید»، «بیانیه طرف مقابل» یا «آمار جدید» فقط وقتی خبر مستقل شوند که واقعاً اطلاعات تازه و مهمی اضافه کنند.
-- اگر رویداد قبلاً در حافظه منتشر شده و ورودی جدید چیز مهم و تازه‌ای اضافه نمی‌کند، relevant=false و duplicate=true بده.
-- اگر همان رویداد اطلاعات مهم تازه‌ای دارد، relevant=true، is_update=true و novelty_score بالا بده و همان event_key قبلی را تا حد امکان حفظ کن.
-- اگر رویداد جدید است، event_key جدید و مشخصی بساز.
-- event_key باید کوتاه، مشخص و وابسته به همان رویداد باشد؛ از کلیدهای عمومی مثل iran_news، military_news، breaking_news استفاده نکن.
+2) ترجمه و فارسی:
+- فارسی باید شبیه نوشته خبرنگار ایرانی باشد، نه ترجمه ماشینی.
+- جمله‌ها روشن و خوش‌خوان باشند و از ترکیب‌های تحت‌اللفظی دوری کن.
+- از نیم‌فاصله و نشانه‌گذاری درست استفاده کن.
+- اصطلاحات نظامی رایج را به معادل جاافتاده فارسی تبدیل کن؛ از معادل‌سازی خلاقانه و نامأنوس پرهیز کن.
+- اگر یک اصطلاح تخصصی معادل جاافتاده‌ای ندارد یا درباره آن شک داری، شکل انگلیسی را حفظ کن یا انگلیسی را داخل پرانتز بیاور؛ اصطلاح عجیب نساز.
+- نام مدل‌ها، کدها و designationها مثل F-16V، B-52، MiG-29، K9، AESA و موارد مشابه را ترجمه نکن و در صورت نیاز همان شکل استاندارد لاتین را حفظ کن.
+- نام اشخاص، شهرها و سازمان‌ها را یکدست و استاندارد بنویس. املای یک نام در یک پست نباید در پاراگراف بعدی تغییر کند.
+- از ساختن آوانویسی عجیب برای نام روستا، شهر، شرکت یا شخص خودداری کن.
+- برای نامی که مطمئن نیستی، شکل لاتین یا شکل منبع را حفظ کن.
 
-سبک نوشتار بر اساس نوع خبر:
-- جنگ/درگیری: سریع، مستقیم و واقعیت‌محور.
-- ژئوپلیتیک: زمینه‌دارتر، با توضیح کوتاه درباره اهمیت واقعی رویداد.
-- فناوری/تجهیزات دفاعی: فنی‌تر اما قابل‌فهم و بدون حدس.
-- خبر مرتبط با ایران: زمینه لازم را کوتاه و روشن ارائه کن.
-- خبر فوری: عنوان کوتاه و اطلاعات اصلی در جمله اول.
-- خبر مهم: می‌تواند یک پاراگراف توضیحی بیشتر داشته باشد.
+3) واژه‌های ترجیحی:
+اصطلاحات زیر را با معادل جاافتاده استفاده کن و از ترجمه لفظ‌به‌لفظ آن‌ها دوری کن:
+""" + "\n".join(f"- {k} = {v}" for k, v in PREFERRED_MILITARY_TERMS.items()) + r"""
 
-طول هوشمند:
-- brief: حدود 45 تا 90 کلمه.
-- standard: حدود 90 تا 160 کلمه.
-- full: حدود 150 تا 230 کلمه.
-- فقط اگر واقعاً ارزش اطلاعاتی دارد از full استفاده کن.
-- اگر خبر چندمنبعی، update، مهم/فوری، تحلیلی یا از نظر وضعیت منبع حساس است، needs_editor=true بده؛ برای خبرهای ساده false کافی است.
+4) سبک نگارش:
+- هیچ قالب ثابت برای همه پست‌ها نساز.
+- از شروع‌های تکراری مثل «بر اساس گزارش‌های اولیه»، «در تحولات اخیر»، «در ادامه تحولات» و «این موضوع نشان می‌دهد» به‌صورت پیش‌فرض استفاده نکن.
+- اگر خبر قطعی و دارای منبع روشن است، مستقیم با خود اتفاق شروع کن.
+- اگر خبر یک ادعاست، وضعیت ادعا را در همان جمله یا متن طبیعی توضیح بده.
+- «چرا مهم است» فقط وقتی بنویس که از خود داده‌های ورودی بتوان نکته مشخصی استخراج کرد؛ این توضیح باید در بدنه حل شود و هرگز به‌عنوان پاراگراف پایانی کلیشه‌ای یا با برچسب «📌» اضافه نشود.
+- در پایان پست، تحلیل خودساخته، جمع‌بندی کلی، پیش‌بینی یا جمله‌ای از جنس «این موضوع نشان‌دهنده...» اضافه نکن.
+- هشتگ اضافی تولید نکن؛ فوتر توسط کد اضافه می‌شود.
+- نام منبع/کانال، یوزرنیم، آیدی، لینک و عبارت‌های attribution هرگز در title/body نیاید.
 
-اهمیت و پاراگراف 📌:
-- important=true را فقط برای خبرهایی بده که واقعاً ارزش قرار گرفتن زودتر در صف را دارند.
-- significance فقط وقتی پر شود که توضیح واقعی و فشرده‌ای درباره اهمیت رویداد بدهد؛ جمله عمومی و مصنوعی نباشد.
-- significance نباید صرفاً تکرار بدنه باشد.
+5) تنوع فرمت:
+style_mode را آگاهانه انتخاب کن:
+- breaking: کوتاه و مستقیم؛ مهم‌ترین خبر در جمله اول.
+- brief: خلاصه 1 تا 2 پاراگراف.
+- standard: خبر کامل و متعادل در 3 تا 4 پاراگراف کوتاه.
+- important: کمی زمینه بیشتر، فقط اگر لازم است.
+- conflict: خبر درگیری/عملیات، سریع و واقعیت‌محور.
+- geopolitics: زمینه ژئوپلیتیکی کوتاه و مستند.
+- defense_tech: تجهیزات و فناوری؛ اعداد فقط از ورودی.
+- fact_check: تفکیک روشن «ادعا چه می‌گوید» از «چه چیزی تأیید شده/نشده».
+- comparison: مقایسه فقط با داده‌هایی که در ورودی هست؛ بدون رتبه‌بندی ساختگی.
+- context: خبر + زمینه لازم برای فهم آن.
+- iran: خبر مرتبط با ایران با لحن خبری حرفه‌ای و دقیق.
+- analysis: فقط وقتی واقعاً داده کافی برای توضیح وجود دارد؛ بدون پیش‌بینی‌سازی.
+- standard: انتخاب پیش‌فرض وقتی قالب خاص لازم نیست.
 
-جلوگیری از تکرار زبانی:
-از عبارت‌های پرتکرار مانند «این در حالی است که»، «در همین راستا»، «بر اساس گزارش‌های منتشرشده» و «این موضوع نشان می‌دهد» بیش از حد استفاده نکن.
-اگر وضعیت منبع باید بیان شود، تنوع طبیعی ایجاد کن: «بر اساس گزارش اولیه»، «این ادعا هنوز تأیید مستقل نشده»، «به گفته منابع»، «منابع موجود می‌گویند» و مانند آن؛ فقط زمانی که از نظر محتوایی لازم است.
+6) ارزش خبری:
+برای هر خروجی news_score از 0 تا 100 بده. این امتیاز باید بر اساس این پنج مؤلفه باشد:
+- اهمیت نظامی/امنیتی: 25
+- اعتبار و کیفیت شواهد موجود در ورودی: 25
+- تازگی: 15
+- اثر ژئوپلیتیکی/عملیاتی: 15
+- جذابیت و ارزش آموزشی برای مخاطب: 20
+قواعد:
+- زیر 50 = حذف.
+- 50 تا 64 = فقط اگر هیچ گزینه بهتر و باامتیاز بالاتر در صف نباشد.
+- 65 تا 79 = قابل انتشار.
+- 80 تا 100 = خبر مهم/اولویت‌دار.
+امتیاز بالا هرگز نباید ناشی از حدس یا علاقه شخصی باشد.
 
-محتوای کانال:
-content_bucket دقیقاً یکی از این پنج مقدار باشد:
-- iran
-- middle_east_war
-- middle_east_developments
-- russia_ukraine
-- superpower_military
-هر چیز خارج از این پنج سبد relevant=false شود.
+7) تفکیک خبر و تحلیل:
+- title و جمله اول = خود اتفاق.
+- بدنه = جزئیات مستند.
+- توضیح اهمیت = فقط در صورت وجود داده روشن و در دل بدنه.
+- «significance» تولید نکن؛ فیلد آن در این نسخه وجود ندارد.
+- هیچ conclusion آماده و تکراری نساز.
 
-region دقیقاً یکی از این چهار مقدار:
-- iran
-- middle_east
-- world
-- superpower
+8) حافظه رویداد:
+- خبرهای مربوط به یک رویداد را ادغام کن.
+- update فقط وقتی است که اطلاعات تازه و معنی‌دار وجود داشته باشد.
+- event_key باید مشخص و اختصاصی باشد و به رویداد واقعی اشاره کند، نه کلیدهای عمومی.
+- post_indices فقط شماره ورودی‌هایی باشد که واقعاً همان رویداد را پشتیبانی می‌کنند.
+- media_post_index را فقط وقتی انتخاب کن که رسانه همان ورودی واقعاً مربوط به همین رویداد است؛ در غیر این صورت 0.
+- تصاویر عمومی و تزئینی انتخاب نکن.
 
-نوع رویداد:
-event_type یکی از:
-- military_event
-- security
-- defense
-- geopolitics
-- routine
-
-category یکی از:
-- military
-- security
-- defense
-- geopolitics
-- technology
-- general
-
-verification یکی از:
-- reported
-- developing
-- confirmed
-- analysis
-
-style_mode یکی از:
-- breaking
-- conflict
-- geopolitics
-- defense_tech
-- iran
-- important
-- analysis
-- standard
-
-length_class یکی از:
-- brief
-- standard
-- full
-
-post_indices را با شماره ورودی‌هایی که برای همان خروجی استفاده شده‌اند مشخص کن.
-entities فهرست کوتاه نام‌های کلیدی همان رویداد باشد؛ حداکثر 10 مورد.
+9) خروجی:
+فقط JSON معتبر مطابق ساختار مورد انتظار برگردان و هیچ Markdown یا توضیح اضافه نده.
 
 ورودی‌های خام:
 {content}
+
+تاریخ امروز به وقت تهران:
+{current_date}
 
 حافظه کوتاه‌مدت رویدادهای قبلی:
 {event_memory}
@@ -477,86 +557,94 @@ entities فهرست کوتاه نام‌های کلیدی همان رویداد 
 حافظه سبک کانال:
 {style_memory}
 
-فقط JSON معتبر و بدون Markdown برگردان:
+ساختار دقیق:
 {
   "items": [
     {
       "draft_id": 0,
       "relevant": true,
       "duplicate": false,
+      "duplicate_reason": "",
       "is_update": false,
       "novelty_score": 0,
+      "news_score": 0,
       "event_key": "unique_event_key",
       "title": "...",
       "body": "...",
-      "significance": "",
-      "image_query": "3 to 6 English words",
       "post_indices": [1],
-      "content_bucket": "iran|middle_east_war|middle_east_developments|russia_ukraine|superpower_military",
-      "region": "iran|middle_east|world|superpower",
-      "event_type": "military_event|security|defense|geopolitics|routine",
-      "category": "military|security|defense|geopolitics|technology|general",
-      "verification": "reported|developing|confirmed|analysis",
+      "media_post_index": 0,
+      "verification": "reported",
       "urgent": false,
       "important": false,
       "needs_editor": false,
-      "style_mode": "breaking|conflict|geopolitics|defense_tech|iran|important|analysis|standard",
-      "length_class": "brief|standard|full",
-      "priority_hint": 0,
-      "source_note": "...",
-      "entities": ["..."],
-      "duplicate_reason": ""
+      "style_mode": "standard",
+      "length_class": "standard",
+      "entities": ["..."]
     }
   ]
 }
 """
 
-EDITOR_PROMPT = """تو سردبیر نهایی همان کانال خبری فارسی هستی.
-ورودی شامل پیش‌نویس‌هایی است که قبلاً از منابع اصلی استخراج شده‌اند و بخشی از ورودی خام نیز برای کنترل واقعیت در اختیار توست.
 
-فقط کارهای زیر را انجام بده:
-1) فارسی را طبیعی‌تر، حرفه‌ای‌تر و خبرگزاری‌گونه کن.
-2) جمله‌های ماشینی، کلیشه‌ای و ترجمه‌وار را حذف کن.
-3) تیتر را انسانی و غیرکلیشه‌ای کن، بدون کلیک‌بیت.
-4) غلط نگارشی، نیم‌فاصله، نشانه‌گذاری و ساختار جمله را اصلاح کن.
-5) هیچ واقعیت جدیدی اضافه نکن و هیچ عدد، نام یا ادعایی را بدون پشتوانه تغییر نده.
-6) وضعیت تأیید خبر را شفاف ولی طبیعی نگه دار.
-7) اگر significance خالی است فقط در صورتی پرش کن که واقعاً برای درک اهمیت خبر لازم باشد.
-8) اطلاعات اصلی باید در جمله اول باقی بماند.
-9) event_key، post_indices، content_bucket، region و verification را فقط در صورت وجود خطای واضح اصلاح کن.
-10) یک خبر مستقل را با قالب قبلی تکرار نکن.
+EDITOR_PROMPT = """تو ویراستار نهایی همان کانال خبری فارسی هستی.
+پیش‌نویس‌های ورودی ممکن است ترجمه ماشینی، نام ناهماهنگ، تاریخ اشتباه، غلط املایی یا ادعای بیش از حد داشته باشند. وظیفه تو این است که آن‌ها را اصلاح کنی، بدون اینکه واقعیت جدید بسازی.
 
-JSON معتبر و بدون Markdown برگردان:
+قواعد:
+- معنی خبر را حفظ کن؛ فقط زبان، ساختار، دقت و خوانایی را بهتر کن.
+- هیچ عدد، تاریخ، مکان، نام، توانمندی یا ادعای تازه‌ای اضافه نکن.
+- تاریخ و زمان را فقط از ورودی خام بگیر؛ هیچ تاریخ جدیدی حدس نزن.
+- اگر نامی در ورودی لاتین و استاندارد است، آن را خراب نکن.
+- مدل‌ها و designationهای نظامی مثل F-16V، B-52، MiG-29 و AESA را ترجمه یا بازنویسی نکن.
+- اصطلاحات نظامی جاافتاده فارسی را حفظ کن؛ از ترجمه تحت‌اللفظی و واژه‌های عجیب جلوگیری کن.
+- اگر درباره ترجمه یا املای یک نام تردید داری، شکل لاتین/شکل منبع امن‌تر از آوانویسی ساختگی است.
+- «بر اساس گزارش‌های اولیه» را فقط وقتی استفاده کن که واقعاً خبر اولیه/غیرقطعی باشد.
+- confirmation را بالا نبر مگر اینکه پشتوانه روشن در ورودی وجود داشته باشد.
+- ادعا، مشاهده و واقعیت تأییدشده را قاطی نکن.
+- هیچ attribution به کانال/یوزرنیم/منبع در title/body نیاور.
+- هیچ «📌» و هیچ تحلیل کلیشه‌ای در پایان پست اضافه نکن.
+- هر توضیح درباره اهمیت خبر باید در بدنه و بر اساس داده‌های واقعی ورودی باشد.
+- تیترها و شروع پاراگراف‌ها را با نمونه‌های قبلی تکرار نکن.
+- اگر خبر ارزش واقعی ندارد، relevant=false کن.
+- news_score را واقع‌بینانه نگه دار.
+- media_post_index فقط برای رسانه‌ای باشد که واقعاً مربوط به همان خبر است؛ در غیر این صورت 0.
+
+اصلاحات صرفاً زبانی:
+- املای فارسی، نیم‌فاصله، نشانه‌گذاری و جمله‌بندی را اصلاح کن.
+- شکل استاندارد اصطلاحات نظامی را بر شکل تحت‌اللفظی ترجیح بده.
+
+ساختار خروجی:
 {
   "items": [
     {
       "draft_id": 1,
       "relevant": true,
       "duplicate": false,
+      "duplicate_reason": "",
       "is_update": false,
       "novelty_score": 0,
+      "news_score": 0,
       "event_key": "...",
       "title": "...",
       "body": "...",
-      "significance": "",
-      "image_query": "...",
       "post_indices": [1],
-      "content_bucket": "iran|middle_east_war|middle_east_developments|russia_ukraine|superpower_military",
-      "region": "iran|middle_east|world|superpower",
-      "event_type": "military_event|security|defense|geopolitics|routine",
-      "category": "military|security|defense|geopolitics|technology|general",
-      "verification": "reported|developing|confirmed|analysis",
+      "media_post_index": 0,
+      "verification": "reported",
       "urgent": false,
       "important": false,
-      "style_mode": "breaking|conflict|geopolitics|defense_tech|iran|important|analysis|standard",
-      "length_class": "brief|standard|full",
-      "priority_hint": 0,
-      "source_note": "...",
+      "needs_editor": false,
+      "style_mode": "standard",
+      "length_class": "standard",
       "entities": ["..."]
     }
   ]
 }
+
+همین واژه‌نامه اصطلاحات را مبنا قرار بده:
+""" + "\n".join(f"- {k} = {v}" for k, v in PREFERRED_MILITARY_TERMS.items()) + r"""
+
+متن را مستقیم، حرفه‌ای و طبیعی نگه دار. خروجی فقط JSON معتبر و بدون Markdown باشد.
 """
+
 
 # ============================================================
 # General helpers
@@ -646,7 +734,7 @@ def safe_int(value, default=0):
 
 
 def normalize_persian_text(text):
-    """ویراستاری سطح سیستم برای خروجی فارسی؛ عمداً محافظه‌کار است."""
+    """ویراستاری سطح سیستم برای خروجی فارسی؛ محافظه‌کار و صرفاً زبانی."""
     text = str(text or "")
     if not text:
         return ""
@@ -664,9 +752,14 @@ def normalize_persian_text(text):
         "،,": "،",
         ",": "،",
         ";": "؛",
+        "؟؟": "؟",
+        "!!": "!",
     }
-    for old, new in replacements.items():
-        text = text.replace(old, new)
+    for old_value, new_value in replacements.items():
+        text = text.replace(old_value, new_value)
+
+    for old_value, new_value in PERSIAN_SPELLING_REPLACEMENTS.items():
+        text = text.replace(old_value, new_value)
 
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     text = re.sub(r"[ \t]+", " ", text)
@@ -739,7 +832,7 @@ def event_key_or_signature(title, body, event_key=""):
 
 def default_state():
     return {
-        "version": 4,
+        "version": 4.5,
         "_source_initialized": {},
         "_recent_titles": [],
         "_recent_events": [],
@@ -748,6 +841,7 @@ def default_state():
         "_pending_queue": [],
         "_retry_uids": {},
         "_last_queue_release_ts": 0,
+        "_last_health_log_ts": 0,
         "_last_morning_date": "",
         "_last_night_date": "",
         "_last_queue_purge_date": "",
@@ -1141,9 +1235,14 @@ def calculate_priority(item):
     if is_breaking(text):
         score += 18
 
-    # راهنمای Gemini فقط نقش tie-breaker دارد.
+    # ارزش خبری مدل فقط بخشی از اولویت است؛ خبر کم‌امتیاز همچنان امکان انتشار
+    # دارد، اما خبر 65+ در صف جلوتر می‌رود.
+    news_score = min(100, max(0, safe_int(item.get("news_score"), 0)))
+    score += int(news_score * 0.35)
+
+    # راهنمای قدیمی همچنان tie-breaker سبک است.
     model_hint = min(100, max(0, safe_int(item.get("priority_hint"), 0)))
-    score += int(model_hint * 0.12)
+    score += int(model_hint * 0.06)
 
     # تازگی خبر هم در اولویت اثر می‌گذارد؛ خبر بسیار قدیمی نباید صرفاً به دلیل
     # برچسب important یک‌باره بالاتر از خبر تازه قرار بگیرد.
@@ -1336,7 +1435,11 @@ def provider_model_name(provider):
 
 
 def groq_structured_output_schema():
-    """Schema مشترک Groq برای Stage 1 و Stage 2؛ strict mode خطای JSON validation را حذف می‌کند."""
+    """
+    Schema کوچک و محافظه‌کارانه مشترک برای Stage 1/2.
+    فیلدهای قابل استنتاج مثل region/content_bucket در کد محلی ساخته می‌شوند تا
+    حجم JSON اجباری پایین بماند و Structured Outputs پایدارتر شود.
+    """
     item_properties = {
         "draft_id": {"type": "integer"},
         "relevant": {"type": "boolean"},
@@ -1344,37 +1447,30 @@ def groq_structured_output_schema():
         "duplicate_reason": {"type": "string"},
         "is_update": {"type": "boolean"},
         "novelty_score": {"type": "integer"},
+        "news_score": {"type": "integer"},
         "event_key": {"type": "string"},
         "title": {"type": "string"},
         "body": {"type": "string"},
-        "significance": {"type": "string"},
-        "image_query": {"type": "string"},
         "post_indices": {
             "type": "array",
             "items": {"type": "integer"},
         },
-        "content_bucket": {"type": "string"},
-        "region": {"type": "string"},
-        "event_type": {"type": "string"},
-        "category": {"type": "string"},
+        "media_post_index": {"type": "integer"},
         "verification": {"type": "string"},
         "urgent": {"type": "boolean"},
         "important": {"type": "boolean"},
         "needs_editor": {"type": "boolean"},
         "style_mode": {"type": "string"},
         "length_class": {"type": "string"},
-        "priority_hint": {"type": "integer"},
-        "source_note": {"type": "string"},
         "entities": {
             "type": "array",
             "items": {"type": "string"},
         },
     }
-    item_required = list(item_properties.keys())
     return {
         "type": "json_schema",
         "json_schema": {
-            "name": "raptor_news_items",
+            "name": "raptor_news_items_v45",
             "strict": True,
             "schema": {
                 "type": "object",
@@ -1384,7 +1480,7 @@ def groq_structured_output_schema():
                         "items": {
                             "type": "object",
                             "properties": item_properties,
-                            "required": item_required,
+                            "required": list(item_properties.keys()),
                             "additionalProperties": False,
                         },
                     }
@@ -1417,6 +1513,9 @@ def provider_prompt_payload(provider, prompt, max_output_tokens):
             # GPT-OSS supports include_reasoning=false; this keeps reasoning out of
             # the structured output path and leaves the token budget for JSON itself.
             "include_reasoning": False,
+            # reasoning_effort=low is supported by GPT-OSS 120B and keeps the
+            # classification/rewriting call focused on the requested JSON.
+            "reasoning_effort": "low",
             "response_format": groq_structured_output_schema(),
         }
         return payload
@@ -1746,13 +1845,23 @@ def build_event_memory_context(state):
 
 def build_analysis_content(batch_posts):
     chunks = []
+    current_date = now_tehran().strftime("%Y-%m-%d")
     for index, post in enumerate(batch_posts, start=1):
-        text = truncate_text(post.get("text", ""), AI_INPUT_MAX_CHARS_PER_POST)
+        source_text = post.get("text", "")
+        text = truncate_text(source_text, AI_INPUT_MAX_CHARS_PER_POST)
+        media = []
+        if post.get("photo"):
+            media.append("photo")
+        if post.get("video"):
+            media.append("video")
+        media_label = "، ".join(media) if media else "none"
         chunks.append(
             f"[پست {index}]\n"
-            f"منبع: {post.get('source_name','')}\n"
-            f"زمان: {post.get('published_at','')}\n"
-            f"متن:\n{text}"
+            f"منبع داخلی: {post.get('source_name','')}\n"
+            f"زمان انتشار منبع: {post.get('published_at','')}\n"
+            f"تاریخ امروز تهران: {current_date}\n"
+            f"رسانه منبع: {media_label}\n"
+            f"متن خام:\n{text}"
         )
     return "\n\n---\n\n".join(chunks)
 
@@ -1765,44 +1874,55 @@ def validate_ai_items(items, max_items=EVENT_MAX_OUTPUT_ITEMS):
     allowed_event_types = {"military_event", "security", "defense", "geopolitics", "routine"}
     allowed_categories = {"military", "security", "defense", "geopolitics", "technology", "general"}
     allowed_verification = {"reported", "developing", "confirmed", "analysis"}
-    allowed_styles = {"breaking", "conflict", "geopolitics", "defense_tech", "iran", "important", "analysis", "standard"}
+    allowed_styles = {
+        "breaking", "brief", "standard", "conflict", "defense_tech",
+        "iran", "important", "analysis", "geopolitics",
+        "fact_check", "comparison", "context",
+    }
     allowed_lengths = {"brief", "standard", "full"}
 
     for raw in items[:max_items]:
         if not isinstance(raw, dict):
             continue
+
         relevant = safe_bool(raw.get("relevant"))
         if not relevant:
             validated.append({
+                "draft_id": safe_int(raw.get("draft_id"), 0),
                 "relevant": False,
                 "duplicate": safe_bool(raw.get("duplicate")),
                 "duplicate_reason": normalize_space(str(raw.get("duplicate_reason", "")))[:400],
                 "is_update": False,
                 "novelty_score": 0,
+                "news_score": 0,
                 "event_key": "",
                 "title": "",
                 "body": "",
-                "significance": "",
-                "image_query": "",
                 "post_indices": [],
-                "content_bucket": "",
-                "region": "world",
-                "event_type": "routine",
-                "category": "general",
+                "media_post_index": 0,
                 "verification": "reported",
                 "urgent": False,
                 "important": False,
-                "style_mode": "standard",
+                "needs_editor": False,
+                "style_mode": "brief",
                 "length_class": "brief",
                 "priority_hint": 0,
                 "source_note": "",
                 "entities": [],
+                "significance": "",
+                "image_query": "",
             })
             continue
 
         title = normalize_persian_text(str(raw.get("title", "")))
         body = normalize_persian_text(str(raw.get("body", "")))
         if not title or not body:
+            continue
+
+        news_score = max(0, min(100, safe_int(raw.get("news_score"), 0)))
+        # خبرهای زیر حداقل ارزش خبری اصلاً وارد صف نشوند.
+        if news_score < MIN_NEWS_SCORE:
+            log.info("خبر به علت ارزش خبری پایین حذف شد | score=%s | title=%s", news_score, title[:120])
             continue
 
         event_type = str(raw.get("event_type", "routine")).strip()
@@ -1843,10 +1963,18 @@ def validate_ai_items(items, max_items=EVENT_MAX_OUTPUT_ITEMS):
                 post_indices.append(idx)
         post_indices = post_indices[:AI_BATCH_MAX_POSTS]
 
+        media_post_index = safe_int(raw.get("media_post_index"), 0)
+        if media_post_index < 0 or media_post_index > AI_BATCH_MAX_POSTS:
+            media_post_index = 0
+
         entities = raw.get("entities", [])
         if not isinstance(entities, list):
             entities = []
-        entities = [normalize_persian_text(str(x))[:100] for x in entities if str(x).strip()][:10]
+        entities = [
+            normalize_persian_text(str(x))[:100]
+            for x in entities
+            if str(x).strip()
+        ][:10]
 
         event_key = normalize_event_key(raw.get("event_key", ""))
         if not event_key:
@@ -1861,24 +1989,30 @@ def validate_ai_items(items, max_items=EVENT_MAX_OUTPUT_ITEMS):
             "duplicate_reason": normalize_space(str(raw.get("duplicate_reason", "")))[:400],
             "is_update": safe_bool(raw.get("is_update")),
             "novelty_score": novelty,
+            "news_score": news_score,
             "event_key": event_key,
             "title": title[:240],
             "body": body[:6500],
-            "significance": normalize_persian_text(str(raw.get("significance", "")))[:600],
-            "image_query": normalize_space(str(raw.get("image_query", "")))[:180],
+            "significance": "",
+            "image_query": "",
             "post_indices": post_indices,
+            "media_post_index": media_post_index,
             "content_bucket": bucket,
             "region": region,
             "event_type": event_type,
             "category": category,
             "verification": verification,
             "urgent": safe_bool(raw.get("urgent")),
-            "important": safe_bool(raw.get("important")),
-            "needs_editor": safe_bool(raw.get("needs_editor")),
+            "important": safe_bool(raw.get("important")) or news_score >= 80,
+            "needs_editor": (
+                safe_bool(raw.get("needs_editor"))
+                or news_score < PREFERRED_NEWS_SCORE
+                or (verification in {"reported", "developing"} and news_score < 80)
+            ),
             "style_mode": style_mode,
             "length_class": length_class,
-            "priority_hint": min(100, max(0, safe_int(raw.get("priority_hint"), 0))),
-            "source_note": normalize_space(str(raw.get("source_note", "")))[:500],
+            "priority_hint": min(100, max(0, news_score)),
+            "source_note": "",
             "entities": entities,
         })
     return validated
@@ -1890,6 +2024,7 @@ def analyze_and_rewrite_safe(state, batch_posts, source_name):
 
     content = build_analysis_content(batch_posts)
     prompt = REWRITE_PROMPT.replace("{content}", content)
+    prompt = prompt.replace("{current_date}", now_tehran().strftime("%Y-%m-%d"))
     prompt = prompt.replace("{event_memory}", build_event_memory_context(state))
     prompt = prompt.replace("{style_memory}", build_style_memory_context(state))
 
@@ -1922,10 +2057,11 @@ def build_editor_prompt(state, drafts, source_posts):
                 "event_key": draft.get("event_key", ""),
                 "title": draft.get("title", ""),
                 "body": draft.get("body", ""),
-                "significance": draft.get("significance", ""),
                 "post_indices": draft.get("post_indices", []),
+                "media_post_index": draft.get("media_post_index", 0),
                 "content_bucket": draft.get("content_bucket", ""),
                 "region": draft.get("region", ""),
+                "news_score": draft.get("news_score", 0),
                 "event_type": draft.get("event_type", ""),
                 "category": draft.get("category", ""),
                 "verification": draft.get("verification", ""),
@@ -1985,9 +2121,10 @@ def final_editor(state, drafts, source_posts, first_provider):
 
             merged_item = dict(original)
             for field in (
-                "title", "body", "significance", "event_key", "verification",
-                "style_mode", "length_class", "entities", "source_note", "needs_editor",
-                "priority_hint", "urgent", "important",
+                "title", "body", "event_key", "verification",
+                "style_mode", "length_class", "entities", "needs_editor",
+                "priority_hint", "urgent", "important", "news_score",
+                "media_post_index",
             ):
                 if field in candidate and candidate.get(field) not in (None, ""):
                     merged_item[field] = candidate[field]
@@ -2205,12 +2342,8 @@ def image_query_from_item(item):
 
 def choose_image_url(item, original_posts):
     """
-    اولویت:
-      1) تصویر اصلی منبع
-      2) og:image مقاله
-      3) رسانه پست
-      4) Wikimedia fallback
-      5) None
+    پیش‌فرض v4.5 فقط رسانه‌ای را قبول می‌کند که از خود منابع ورودی آمده باشد.
+    جست‌وجوی تصویر عمومی به‌صورت opt-in باقی می‌ماند و پیش‌فرض خاموش است.
     """
     for post in original_posts:
         if post.get("photo"):
@@ -2220,9 +2353,29 @@ def choose_image_url(item, original_posts):
         if post.get("article_image"):
             return post["article_image"]
 
-    # فقط عکس عمومی موضوعی، نه ادعای عکس همان واقعه.
+    if not ALLOW_GENERIC_IMAGE_FALLBACK:
+        return None
+
     query = image_query_from_item(item)
     return find_wikimedia_image(query)
+
+
+def select_result_media(result, cluster, linked_posts):
+    """
+    اگر مدل یک media_post_index مطمئن داده باشد، رسانه فقط از همان ورودی گرفته می‌شود.
+    در غیر این صورت fallback محافظه‌کارانه روی رسانه‌های linked_posts انجام می‌شود.
+    """
+    preferred = safe_int(result.get("media_post_index"), 0)
+    if 1 <= preferred <= len(cluster):
+        preferred_post = cluster[preferred - 1]
+        photo = preferred_post.get("photo")
+        video = preferred_post.get("video")
+        source_url = preferred_post.get("source_url", "")
+        source_urls = [source_url] if source_url else []
+        if photo or video:
+            return photo, video, source_url, source_urls
+
+    return combine_original_media(linked_posts)
 
 
 # ============================================================
@@ -2522,49 +2675,14 @@ def strip_source_channel_attribution(text):
 
 
 def format_public_title(item):
-    return strip_source_channel_attribution(item.get("title", ""))
+    return normalize_persian_text(
+        strip_source_channel_attribution(item.get("title", ""))
+    )
 
 
 def format_public_body(item):
-    """خروجی نهایی طبیعی است؛ وضعیت تأیید داخل نثر و significance فقط در صورت نیاز می‌آید."""
+    """خروجی عمومی فقط خبر است؛ هیچ تحلیل/📌 یا عبارت قالبیِ تأیید به‌صورت خودکار تزریق نمی‌شود."""
     body = strip_source_channel_attribution(item.get("body", ""))
-    verification = str(item.get("verification", "reported") or "reported").lower()
-    normalized = normalize_for_match(body)
-
-    if verification == "reported" and body:
-        cues = (
-            "بر اساس گزارش",
-            "به گفته",
-            "مدعی",
-            "گزارش اولیه",
-            "گزارش های اولیه",
-            "تایید نشده",
-            "تأیید نشده",
-            "تایید رسمی",
-            "تأیید رسمی",
-            "منابع می گویند",
-        )
-        if not any(normalize_for_match(x) in normalized for x in cues):
-            first = body[0].lower() + body[1:] if len(body) > 1 else body
-            body = "بر اساس گزارش‌های اولیه، " + first
-
-    elif verification == "developing" and body:
-        cues = ("در حال تکمیل", "جزئیات", "هنوز")
-        if not any(normalize_for_match(x) in normalized for x in cues):
-            body += "\n\nجزئیات این خبر همچنان در حال تکمیل است."
-
-    elif verification == "analysis" and body:
-        cues = ("ارزیابی", "تحلیل", "به نظر", "احتمال")
-        if not any(normalize_for_match(x) in normalized for x in cues):
-            first = body[0].lower() + body[1:] if len(body) > 1 else body
-            body = "در ارزیابی اولیه، " + first
-
-    significance = strip_source_channel_attribution(item.get("significance", ""))
-    if significance and len(significance) >= 35:
-        sim = token_similarity(body, significance)
-        if sim < 0.72:
-            body += "\n\n📌 " + significance
-
     return normalize_persian_text(body)
 
 
@@ -3094,16 +3212,38 @@ def choose_next_queue_item(state):
         item = dict(item)
         score = apply_queue_diversity_score(state, item)
 
-        # سن خبر به شکل کنترل‌شده یک tie-breaker است.
+        news_score = safe_int(item.get("news_score"), 0)
+        if news_score < MIN_NEWS_SCORE:
+            continue
+
+        # خبر با ارزش خبری بهتر، کمی اولویت بیشتر می‌گیرد؛ اما ساختار کلی
+        # region/bucket/urgent همچنان در score اصلی دخیل است.
+        score += int(news_score * 0.25)
+
         queued_at = item.get("queued_at", now_ts())
         age_hours = min(24, max(0, (now_ts() - queued_at) / 3600.0))
         score += min(12, int(age_hours))
 
-        # خبر جهانی برای تنوع جریمه مضاعف نمی‌شود.
         candidates.append((score, index, item))
 
-    candidates.sort(key=lambda x: (x[0], x[2].get("urgent", False)), reverse=True)
-    _, index, chosen = candidates[0]
+    if not candidates:
+        return None, None
+
+    preferred = [
+        item for item in candidates
+        if safe_int(item[2].get("news_score"), 0) >= PREFERRED_NEWS_SCORE
+    ]
+    pool = preferred or candidates
+
+    pool.sort(
+        key=lambda x: (
+            x[0],
+            bool(x[2].get("urgent", False)),
+            safe_int(x[2].get("news_score"), 0),
+        ),
+        reverse=True,
+    )
+    _, index, chosen = pool[0]
     return index, chosen
 
 
@@ -3230,7 +3370,11 @@ def process_cluster(state, source_key, cluster):
         or safe_bool(x.get("important"))
         or safe_bool(x.get("urgent"))
         or safe_bool(x.get("is_update"))
-        or x.get("style_mode") in {"analysis", "geopolitics"}
+        or x.get("style_mode") in {
+            "analysis", "geopolitics", "fact_check", "comparison",
+            "defense_tech",
+        }
+        or safe_int(x.get("news_score"), 0) < PREFERRED_NEWS_SCORE
         or x.get("length_class") == "full"
         for x in drafts
     ) or len(cluster) > 1
@@ -3264,7 +3408,9 @@ def process_cluster(state, source_key, cluster):
             if 1 <= safe_int(idx, 0) <= len(cluster)
         ]
         linked_posts = [cluster[idx - 1] for idx in linked_indices] if linked_indices else cluster
-        result_photo, result_video, result_source_url, result_source_urls = combine_original_media(linked_posts)
+        result_photo, result_video, result_source_url, result_source_urls = select_result_media(
+            result, cluster, linked_posts
+        )
 
         title = normalize_persian_text(result.get("title", ""))
         body = normalize_persian_text(result.get("body", ""))
@@ -3288,7 +3434,8 @@ def process_cluster(state, source_key, cluster):
             "style_mode": result.get("style_mode", "standard"),
             "length_class": result.get("length_class", "standard"),
             "priority_hint": safe_int(result.get("priority_hint"), 0),
-            "source_note": result.get("source_note", ""),
+            "news_score": max(0, min(100, safe_int(result.get("news_score"), 0))),
+            "source_note": "",
             "event_key": normalize_event_key(result.get("event_key", "")) or event_key_or_signature(title, body),
             "event_signature": event_signature(f"{title} {body}"),
             "is_update": safe_bool(result.get("is_update")),
@@ -3458,6 +3605,32 @@ def build_gemini_batches(clusters):
     return batches
 
 
+
+def log_runtime_health(state):
+    """لاگ سبک دوره‌ای برای مشاهده صف و وضعیت موتورهای AI در Railway."""
+    now = now_ts()
+    last = float(state.get("_last_health_log_ts", 0) or 0)
+    if last and now - last < 10 * 60:
+        return
+
+    state["_last_health_log_ts"] = now
+    queue_len = len(state.get("_pending_queue", []))
+    provider_parts = []
+    for provider in AI_PROVIDER_ORDER:
+        pstate = provider_state(state, provider)
+        cooldown = max(0, int(float(pstate.get("cooldown_until", 0) or 0) - now))
+        provider_parts.append(
+            f"{AI_PROVIDER_LABELS[provider]}:cooldown={cooldown}s"
+        )
+
+    log.info(
+        "health | queue=%s | providers=%s | state=%s",
+        queue_len,
+        " ".join(provider_parts),
+        STATE_FILE,
+    )
+
+
 def process_once(state):
     """
     چرخه v4:
@@ -3565,6 +3738,7 @@ def process_once(state):
     process_queue(state)
     purge_recent_memories(state)
     purge_recent_inputs(state)
+    log_runtime_health(state)
     save_state(state)
 
 
@@ -3607,7 +3781,7 @@ def main():
     save_state(state)
 
     log.info("==============================================")
-    log.info("Raptor News Bot v4 شروع شد")
+    log.info("Raptor News Bot v4.5 شروع شد")
     log.info("Telegram sources: %s", len(SOURCE_CHANNELS))
     log.info(
         "AI pipeline: Groq -> Gemini -> Mistral | keys: Groq=%s Gemini=%s Mistral=%s",
